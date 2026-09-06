@@ -828,42 +828,77 @@ def search_root(board, soft_s, hard_s):
     SEARCH.seldepth = 0
     SEARCH.path = []
 
-    moves = list(board.legal_moves)
-    if not moves:
+    root_moves = list(board.legal_moves)
+    if not root_moves:
         return None, 0, 0, ""
 
-    best_move = moves[0]
+    best_move = root_moves[0]
     best_score = 0
     completed_depth = 0
     pv = ""
 
+    # The root loop is explicit rather than deferred to negamax, so best_move
+    # always comes from a search we actually ran. Reading it back out of the TT
+    # instead is unsafe: buckets are indexed by key & TT_MASK, so a colliding
+    # position can evict the root entry and leave a stale move behind.
     for depth in range(1, MAX_DEPTH_CAP + 1):
-        try:
-            score = negamax(board, depth, -INFINITY, INFINITY, 0, None)
-        except TimeUp:
+        alpha = -INFINITY
+        beta = INFINITY
+        iter_move = None
+        iter_score = -INFINITY
+        finished = True
+
+        # Previous iteration's best goes first; that is most of what iterative
+        # deepening is for.
+        ordered = order_moves(board, root_moves, best_move, 0, None)
+
+        for index, move in enumerate(ordered):
+            board.push(move)
+            try:
+                if index == 0:
+                    score = -negamax(board, depth - 1, -beta, -alpha, 1, move)
+                else:
+                    score = -negamax(board, depth - 1, -alpha - 1, -alpha,
+                                     1, move)
+                    if alpha < score < beta:
+                        score = -negamax(board, depth - 1, -beta, -alpha,
+                                         1, move)
+            except TimeUp:
+                finished = False
+                break
+            finally:
+                board.pop()
+
+            if score > iter_score:
+                iter_score = score
+                iter_move = move
+                if score > alpha:
+                    alpha = score
+
+        # A partial iteration is still usable: the previous best was searched
+        # first, so anything that beat it beat it on a real search.
+        if iter_move is not None:
+            best_move = iter_move
+            best_score = iter_score
+
+        if not finished:
             break
 
-        key = chess.polyglot.zobrist_hash(board)
-        entry = TT[key & TT_MASK]
-        if (entry is not None and entry[0] == key and entry[4] is not None
-                and entry[4] in board.legal_moves):
-            best_move = entry[4]
-        best_score = score
         completed_depth = depth
-        pv = _extract_pv(board, 8)
+        pv = _extract_pv(board, best_move, 8)
 
         if DEBUG:
             elapsed = time.perf_counter() - start
             nps = int(SEARCH.nodes / elapsed) if elapsed > 0 else 0
             print(
                 f"  depth {depth:2d} seldepth {SEARCH.seldepth:2d} "
-                f"score {_format_score(score)} nodes {SEARCH.nodes} "
+                f"score {_format_score(best_score)} nodes {SEARCH.nodes} "
                 f"nps {nps} time {elapsed * 1000:.0f}ms pv {pv}",
                 file=sys.stderr,
             )
 
         # A forced mate is found; no deeper search can improve on it.
-        if abs(score) > MATE_BOUND:
+        if abs(best_score) > MATE_BOUND:
             break
 
         # Soft limit: do not start an iteration we almost certainly cannot
@@ -882,12 +917,21 @@ def _format_score(score):
     return f"cp {score}"
 
 
-def _extract_pv(board, limit):
-    """Walk the transposition table to recover the principal variation."""
+def _extract_pv(board, root_move, limit):
+    """Recover the principal variation for logging.
+
+    The root move is passed in rather than looked up: the root loop searches
+    ply 0 itself, so negamax never stores an entry for the root position.
+    """
     line: list[str] = []
     scratch = board.copy(stack=False)
+    if root_move is None or root_move not in scratch.legal_moves:
+        return ""
+    line.append(scratch.san(root_move))
+    scratch.push(root_move)
+
     seen = set()
-    for _ in range(limit):
+    for _ in range(limit - 1):
         key = chess.polyglot.zobrist_hash(scratch)
         if key in seen:
             break
