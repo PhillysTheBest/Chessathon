@@ -248,8 +248,21 @@ PASSED_MG = [0, 5, 12, 22, 42, 78, 130, 0]
 PASSED_EG = [0, 12, 24, 44, 78, 130, 200, 0]
 ROOK_OPEN_MG, ROOK_OPEN_EG = 28, 12
 ROOK_SEMI_MG, ROOK_SEMI_EG = 12, 6
-KING_SHIELD_MG = 9
 TEMPO = 12
+
+# King safety. The 5x5 board had nowhere to hide, so the original engine leaned
+# on eval_king_mobility and a pawn screen. On 8x8 an attack is built over
+# several moves by pieces converging on the squares around the king, and an
+# evaluation that cannot see that coming will happily strip its own shield for
+# a few centipawns of activity somewhere else.
+KING_SHIELD_MG = 14
+KING_OPEN_FILE_MG = -26  # no pawn of either colour on a file beside the king
+KING_SEMI_FILE_MG = -13  # no pawn of ours, but one of theirs
+
+# Attack units contributed per attacked square in the enemy king zone.
+KING_ATTACK_WEIGHT = [0, 0, 20, 20, 40, 80, 0]
+# Danger grows faster than linearly: two attackers are worth far more than one.
+KING_DANGER = [min(600, (units * units) // 20) for units in range(128)]
 
 MOBILITY_MG = [0, 0, 4, 4, 2, 1, 0]
 MOBILITY_EG = [0, 0, 4, 3, 4, 2, 0]
@@ -260,6 +273,12 @@ PASSED_MASK = [[0] * 64 for _ in range(2)]
 FRONT_FILE = [[0] * 64 for _ in range(2)]
 # The three squares in front of a king, for the pawn shield.
 KING_SHIELD = [[0] * 64 for _ in range(2)]
+# KING_ZONE[color][square]: the squares around a king of `color`, extended one
+# rank towards the enemy, which is the direction an attack arrives from.
+KING_ZONE = [[0] * 64 for _ in range(2)]
+# The one to three file masks beside a king, precomputed so the eval does not
+# redo square_file / range / clamping arithmetic at every node.
+KING_FILES: list[tuple[int, ...]] = [()] * 64
 ADJACENT_FILES = [0] * 8
 
 
@@ -300,6 +319,22 @@ def _init_masks():
                     shield_b |= chess.BB_SQUARES[chess.square(nf, r - 1)]
         KING_SHIELD[chess.WHITE][square] = shield_w
         KING_SHIELD[chess.BLACK][square] = shield_b
+
+        ring = chess.BB_KING_ATTACKS[square] | chess.BB_SQUARES[square]
+        for color in (chess.WHITE, chess.BLACK):
+            step = 1 if color == chess.WHITE else -1
+            extended = ring
+            for s in chess.scan_forward(ring):
+                nr = chess.square_rank(s) + step
+                if 0 <= nr <= 7:
+                    extended |= chess.BB_SQUARES[
+                        chess.square(chess.square_file(s), nr)]
+            KING_ZONE[color][square] = extended
+
+        KING_FILES[square] = tuple(
+            chess.BB_FILES[nf]
+            for nf in range(max(0, f - 1), min(7, f + 1) + 1)
+        )
 
 
 _init_masks()
@@ -380,11 +415,28 @@ def evaluate(board):
     white_pawns = board.pawns & board.occupied_co[chess.WHITE]
     black_pawns = board.pawns & board.occupied_co[chess.BLACK]
 
+    # Zone around each king, held as the zone its OPPONENT is attacking.
+    # Skipped when the attacker has no queen: a king hunt without one almost
+    # never breaks through, and dropping the term there costs nothing and buys
+    # back most of what king safety spends in queenless positions.
+    kings = board.kings
+    queens = board.queens
+    white_king_bb = kings & board.occupied_co[chess.WHITE]
+    black_king_bb = kings & board.occupied_co[chess.BLACK]
+    zone_of = [0, 0]
+    if black_king_bb and queens & board.occupied_co[chess.WHITE]:
+        zone_of[chess.WHITE] = KING_ZONE[chess.BLACK][black_king_bb.bit_length() - 1]
+    if white_king_bb and queens & board.occupied_co[chess.BLACK]:
+        zone_of[chess.BLACK] = KING_ZONE[chess.WHITE][white_king_bb.bit_length() - 1]
+    attack_units = [0, 0]
+
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color else -1
         own = board.occupied_co[color]
         own_pawns = white_pawns if color else black_pawns
         their_pawns = black_pawns if color else white_pawns
+        # The zone around the king we are attacking.
+        target_zone = zone_of[color]
 
         pst_mg = PST_MG[color]
         pst_eg = PST_EG[color]
@@ -438,15 +490,38 @@ def evaluate(board):
                 elif piece_type == chess.KING:
                     shield = (KING_SHIELD[color][square] & own_pawns).bit_count()
                     mg += sign * KING_SHIELD_MG * shield
+                    # An open or half-open file beside the king is the road an
+                    # attack travels down. Pushing the pawn in front of your
+                    # own king should cost more than the tempo it buys.
+                    for file_bb in KING_FILES[square]:
+                        if not (file_bb & own_pawns):
+                            mg += sign * (
+                                KING_SEMI_FILE_MG if file_bb & their_pawns
+                                else KING_OPEN_FILE_MG
+                            )
 
                 if mobile:
-                    moves = (board.attacks_mask(square) & ~own).bit_count()
+                    attacked = board.attacks_mask(square)
+                    moves = (attacked & ~own).bit_count()
                     mg += sign * MOBILITY_MG[piece_type] * moves
                     eg += sign * MOBILITY_EG[piece_type] * moves
+                    # Same mask, reused: how much of the enemy king's zone this
+                    # piece covers. Nearly free, since attacks_mask is already
+                    # paid for by the mobility term.
+                    if target_zone:
+                        hits = (attacked & target_zone).bit_count()
+                        if hits:
+                            attack_units[color] += (
+                                KING_ATTACK_WEIGHT[piece_type] * hits)
 
         if board.pieces_mask(chess.BISHOP, color).bit_count() >= 2:
             mg += sign * BISHOP_PAIR_MG
             eg += sign * BISHOP_PAIR_EG
+
+    # King danger is a midgame term only: with the queens off, a king in the
+    # open is an asset, not a liability, and the endgame PSTs already say so.
+    mg += (KING_DANGER[min(attack_units[chess.WHITE] // 8, 127)]
+           - KING_DANGER[min(attack_units[chess.BLACK] // 8, 127)])
 
     # Taper between the midgame and endgame scores.
     if phase > MAX_PHASE:
@@ -828,6 +903,8 @@ def search_root(board, soft_s, hard_s):
     SEARCH.seldepth = 0
     SEARCH.path = []
 
+    base_stack = len(board.move_stack)
+
     root_moves = list(board.legal_moves)
     if not root_moves:
         return None, 0, 0, ""
@@ -836,6 +913,8 @@ def search_root(board, soft_s, hard_s):
     best_score = 0
     completed_depth = 0
     pv = ""
+    prev_score = None
+    prev_move = None
 
     # The root loop is explicit rather than deferred to negamax, so best_move
     # always comes from a search we actually ran. Reading it back out of the TT
@@ -867,7 +946,16 @@ def search_root(board, soft_s, hard_s):
                 finished = False
                 break
             finally:
-                board.pop()
+                # Unwind to our own depth rather than popping once. When TimeUp
+                # is raised deep in the tree it propagates straight through
+                # negamax's and qsearch's move loops, which push before the
+                # recursive call and pop after it, so every frame in flight
+                # leaks its push. Popping once would leave the board sitting in
+                # some position several plies down, and every legality check
+                # and san() after this point would be answering about the wrong
+                # position.
+                while len(board.move_stack) > base_stack:
+                    board.pop()
 
             if score > iter_score:
                 iter_score = score
@@ -901,9 +989,28 @@ def search_root(board, soft_s, hard_s):
         if abs(best_score) > MATE_BOUND:
             break
 
-        # Soft limit: do not start an iteration we almost certainly cannot
-        # finish. Each extra ply costs roughly 2-3x the last one.
-        if time.perf_counter() - start > soft_s * 0.5:
+        # Fail-low extension. Stopping on schedule is right when the score is
+        # steady, and wrong exactly when it is not: a root score falling ply
+        # over ply means the last iteration was lying to us and the move we are
+        # about to play rests on it. Buy the extra ply instead. Same, less
+        # urgently, when the best move is still changing.
+        budget = soft_s
+        if depth >= 4 and prev_score is not None:
+            if best_score < prev_score - 40:
+                budget = soft_s * 2.2
+            elif best_move != prev_move:
+                budget = soft_s * 1.5
+        # Stay clear of the hard limit: reaching it costs a whole iteration's
+        # work, since a search aborted mid-iteration contributes nothing past
+        # the moves it already finished.
+        budget = min(budget, hard_s * 0.85)
+
+        prev_score = best_score
+        prev_move = best_move
+
+        # Do not start an iteration we almost certainly cannot finish; each
+        # extra ply costs roughly 2-3x the last one.
+        if time.perf_counter() - start > budget * 0.5:
             break
 
     return best_move, best_score, completed_depth, pv
