@@ -801,10 +801,19 @@ def qsearch(board, alpha, beta, ply):
         return evaluate(board)
 
     in_check = board.is_check()
+    key = None
 
     if in_check:
         # Never stand pat in check. Search every evasion so we do not call a
-        # position quiet while the king is attacked.
+        # position quiet while the king is attacked. That search is a forced
+        # sequence of evasions and intermezzo checks, which can repeat or run
+        # into the 50-move rule the same way a line in negamax can — negamax
+        # guards against that, but qsearch otherwise never does.
+        if board.halfmove_clock >= 100 or board.is_insufficient_material():
+            return 0
+        key = chess.polyglot.zobrist_hash(board)
+        if key in SEARCH.path or SEARCH.game_keys.get(key, 0) >= 2:
+            return 0
         moves = list(board.legal_moves)
         if not moves:
             return -MATE_SCORE + ply
@@ -817,36 +826,51 @@ def qsearch(board, alpha, beta, ply):
         if stand_pat > alpha:
             alpha = stand_pat
         best = stand_pat
-        moves = order_captures(board, list(board.generate_legal_captures()))
+        captures = list(board.generate_legal_captures())
+        # A quiet leaf with no captures left can still be a stalemate rather
+        # than the live position the material-based stand-pat assumes. Real
+        # stalemates are an endgame phenomenon, so gate the legality scan
+        # (unlike captures, not cheap to generate) behind a low piece count
+        # instead of paying it on every quiet leaf.
+        if not captures and board.occupied.bit_count() <= 8 and not any(board.legal_moves):
+            return 0
+        moves = order_captures(board, captures)
 
-    for move in moves:
-        if not in_check:
-            # Delta pruning: if winning this piece outright still leaves us far
-            # below alpha, the capture cannot rescue the position.
-            victim = board.piece_type_at(move.to_square)
-            gain = PIECE_VALUE_MG[victim] if victim else PIECE_VALUE_MG[chess.PAWN]
-            if move.promotion:
-                gain += PIECE_VALUE_MG[move.promotion]
-            if best + gain + DELTA_MARGIN < alpha:
-                continue
+    if key is not None:
+        SEARCH.path.append(key)
+    try:
+        for move in moves:
+            if not in_check:
+                # Delta pruning: if winning this piece outright still leaves us
+                # far below alpha, the capture cannot rescue the position.
+                victim = board.piece_type_at(move.to_square)
+                gain = PIECE_VALUE_MG[victim] if victim else PIECE_VALUE_MG[chess.PAWN]
+                if move.promotion:
+                    gain += PIECE_VALUE_MG[move.promotion]
+                if best + gain + DELTA_MARGIN < alpha:
+                    continue
 
-            # SEE pruning. MVV-LVA happily puts NxQ first even when the queen
-            # is defended three times; playing the exchange out says whether
-            # the capture actually wins material. A capture that loses material
-            # cannot raise alpha, and quiescence is where most of the nodes are.
-            if see(board, move) < QS_SEE_THRESHOLD:
-                continue
+                # SEE pruning. MVV-LVA happily puts NxQ first even when the
+                # queen is defended three times; playing the exchange out says
+                # whether the capture actually wins material. A capture that
+                # loses material cannot raise alpha, and quiescence is where
+                # most of the nodes are.
+                if see(board, move) < QS_SEE_THRESHOLD:
+                    continue
 
-        board.push(move)
-        score = -qsearch(board, -beta, -alpha, ply + 1)
-        board.pop()
+            board.push(move)
+            score = -qsearch(board, -beta, -alpha, ply + 1)
+            board.pop()
 
-        if score > best:
-            best = score
-            if score > alpha:
-                alpha = score
-                if alpha >= beta:
-                    break
+            if score > best:
+                best = score
+                if score > alpha:
+                    alpha = score
+                    if alpha >= beta:
+                        break
+    finally:
+        if key is not None:
+            SEARCH.path.pop()
 
     return best
 
@@ -884,6 +908,17 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
     if ply >= MAX_PLY - 1:
         return evaluate(board)
 
+    in_check = board.is_check()
+
+    # Check extension, capped the same way the 5x5 engine capped it. Applied
+    # before the TT probe below so a cached entry is checked against the depth
+    # this node actually intends to search. Probing with the pre-extension
+    # depth while storing with the post-extension depth let an entry one ply
+    # shallower than the extension guarantees satisfy the cutoff — exactly the
+    # positions the extension exists to search deeper, undermined by the TT.
+    if in_check and ply < 40:
+        depth += 1
+
     # --- transposition probe ----------------------------------------------
     index = key & TT_MASK
     entry = TT[index]
@@ -905,12 +940,6 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
                 return score
             if flag == TT_UPPER and score <= alpha:
                 return score
-
-    in_check = board.is_check()
-
-    # Check extension, capped the same way the 5x5 engine capped it.
-    if in_check and ply < 40:
-        depth += 1
 
     if depth <= 0:
         return qsearch(board, alpha, beta, ply)
