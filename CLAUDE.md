@@ -156,6 +156,7 @@ rewritten, so an arena result attributes cleanly to one constant.
 | v1.1 over v1 — board-unwind fix, fail-low extension, king safety | **73.3%** |
 | v1.3 — repetition counting, low-clock budget cap | safety fixes, not separately measured |
 | v1.4 over v1.3 — lazy eval + SEE at threshold −110 | **70.0%** |
+| v1.6 over v1.5 — TT/check-extension depth fix, qsearch draw detection | safety fixes, sanity-checked only (12 games, 50.0%) |
 
 `submission.zip` should be built from a version that has beaten the one on the
 ladder. As of the last session that is **v1.4**.
@@ -224,6 +225,38 @@ Each was found by reading the per-game stderr log, which is why `DEBUG` stays on
   increment, finishing with 3.6 s left. `LOW_CLOCK_MS` now caps the budget below
   the increment when short, so the clock recovers.
 
+### Self-audit findings, this session (v1.6)
+
+A pass tracing every pruning/ordering mechanism's shared state, done before
+more tuning rather than after another rated-game loss, found two real bugs and
+one measurement gap:
+
+- The TT probe compared a cached entry's depth against the pre-extension depth
+  while the store used the post-extension depth, so an in-check node could
+  accept a cutoff from an entry one ply shallower than the check extension
+  exists to guarantee — at depth 0 specifically, almost any cached entry
+  satisfied the requirement, defeating the extension outright. Fixed by
+  computing the extension before the probe.
+- `qsearch` had no draw detection. Verified with a hand-built stalemate
+  (`k7/8/1Q6/8/8/8/8/7K b - - 0 1`): scored −1009 before the fix, 0 after.
+- **The arena harness's default clock (10s+0.1s) is a different regime than
+  rated games.** A self-play game caps at depth 3-4 on the fast clock but
+  reaches depth 6-8 on the realistic clock (120s+0.5s), matching this file's
+  own rated-game profile. Every pruning-constant sweep on record (RFP, LMP,
+  LMR, SEE) was measured in the shallow regime. Adopt a two-tier protocol from
+  here on: fast clock for screening, but **re-confirm any winner at
+  `--base-ms 120000 --increment-ms 500` before it ships.**
+- Futility pruning's gate is a strict superset of LMP's with no move-index
+  limit, so wherever both are enabled `LMP_COUNT` cannot fire — a likely
+  explanation for the `lmp-tight`/`lmp-loose` null result below. Not yet
+  confirmed; needs a futility-disabled diagnostic arena to isolate.
+
+`baselines/philbert-v16/` freezes these two fixes. Not yet arena-confirmed at
+40 games — only a 12-game fast-clock smoke test (50.0%, no crashes or illegal
+moves). Every sweep below `philbert-v14` predates this baseline; treat
+`philbert-v16` as the control for anything measured from here on.
+  the increment when short, so the clock recovers.
+
 ### Where the strength actually goes
 
 - **Round 46** was lost from +161. One move, `Bc5`, scored +166 at depth 4, +94
@@ -276,17 +309,44 @@ Ordered by expected value. Anything here that claims a gain has to survive a
 
 ### Next
 
+All arenas below run against `baselines/philbert-v16`, not `v14` — see the
+self-audit note above. Screen at the arena's default fast clock; **re-confirm
+any winner at `--base-ms 120000 --increment-ms 500`** before it ships, since
+the fast clock and the realistic clock are now known to reach different
+depths.
+
 - [ ] **Confirm `RFP_MARGIN = 40`** with a second 40 game arena. 61.7% over 30
       games is 1.5 SE, not enough on its own, but `rfp-120` at 20.0% makes the
       direction clear. Also try 20 and 55 to find where the gradient turns.
 - [ ] **Finish the interrupted sweep**: `delta-100`, `delta-350`, `fut-tight`,
       `fut-loose` were never run. `uv run python -m analysis.tune --all` then
-      arena each against `baselines/philbert-v14`.
+      arena each. Note before concluding anything: `DELTA_MARGIN` and
+      `QS_SEE_THRESHOLD=-110` prune overlapping bad-capture populations, so a
+      null result for delta doesn't mean delta pruning is inert.
+- [ ] **New: sweep NMP's `R` formula.** `agent.py`'s `reduction = 2 + depth // 6`
+      has never been tuned. Try a fixed-step alternative closer to reference
+      engines at shallow depth (e.g. `R = 2 + (3 if depth >= 6 else 2)`). Same
+      caveat as delta/SEE: RFP returns before NMP is even reached under the
+      same guard, so a null result may mean RFP is shadowing NMP, not that `R`
+      doesn't matter.
+- [ ] **New: unconfound LMP from futility** (self-audit finding above). Build a
+      diagnostic-only variant with `FUTILITY_MARGIN` set unreachably high, then
+      sweep `LMP_COUNT` tight/loose against *that*, not `v16`. If a real
+      gradient appears where none did before, `LMP_COUNT` has genuine signal
+      that was masked; if still null, the existing conclusion stands on firmer
+      ground. Never ship the futility-disabled variant itself.
+- [ ] **New: staged TT-move-first search.** `negamax` always builds the full
+      legal-move list even when the TT move alone (searched first) would cut
+      off. `Board.is_legal()` doesn't generate the full list, so trying the TT
+      move via `is_legal` first and only generating the rest on a miss is a
+      behavior-preserving speed win — no arena needed to justify it, just the
+      usual gate plus an NPS comparison.
 - [ ] **numba on `evaluate`, first half only**: material, PST and pawn
       structure, which need no attack generation. Measure before attempting
       mobility and king safety, which need sliding attacks reimplemented inside
       numba and are where bugs would live. Spike numbers are in the profile
-      section; argument extraction at 4.01us is the floor.
+      section; argument extraction at 4.01us is the floor. `baselines/numba/`
+      already has an `@njit(cache=False)` precedent to follow.
 
 ### After that
 
