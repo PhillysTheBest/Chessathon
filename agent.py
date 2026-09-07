@@ -615,7 +615,13 @@ def order_moves(board, moves, tt_move, ply, prev_move):
         elif victim_bb:
             attacker = board.piece_type_at(move.from_square)
             victim = board.piece_type_at(to_square)
-            score = 800_000_000 + MVV_LVA[attacker][victim]
+            # Winning and equal captures stay ahead of everything quiet.
+            # Losing ones drop below killers and history: they are still worth
+            # searching, just not first.
+            if see(board, move) < 0:
+                score = 100_000_000 + MVV_LVA[attacker][victim]
+            else:
+                score = 800_000_000 + MVV_LVA[attacker][victim]
         elif board.is_en_passant(move):
             score = 800_000_000 + MVV_LVA[chess.PAWN][chess.PAWN]
         elif move == killer0:
@@ -794,6 +800,13 @@ def qsearch(board, alpha, beta, ply):
             if move.promotion:
                 gain += PIECE_VALUE_MG[move.promotion]
             if best + gain + DELTA_MARGIN < alpha:
+                continue
+
+            # SEE pruning. MVV-LVA happily puts NxQ first even when the queen
+            # is defended three times; playing the exchange out says whether
+            # the capture actually wins material. A capture that loses material
+            # cannot raise alpha, and quiescence is where most of the nodes are.
+            if see(board, move) < 0:
                 continue
 
         board.push(move)
