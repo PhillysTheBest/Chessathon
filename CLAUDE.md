@@ -189,9 +189,25 @@ though it is only an upper bound. Fix both before re-enabling.
 suggested, because the cheap pass still walks every piece. It needs an
 incrementally maintained material/PST total to pay properly.
 
-**Pruning constant sweep.** `lmr-aggr` 50.0%, `lmr-shy` 48.3% — nulls. Combined
-with an effective branching factor already between 1.1 and 4.5, pruning appears
-exhausted.
+### Pruning constant sweep, 30 games each against v1.4
+
+| Variant | Score | Read |
+|---|---|---|
+| `rfp-40` (`RFP_MARGIN = 40`) | **61.7%** | promising, only 1.5 SE, needs confirming |
+| `rfp-120` | **20.0%** | clearly much worse, 3.9 SE below even |
+| `lmp-tight` | 55.0% | no information |
+| `lmp-loose` | 48.3% | null |
+| `lmr-aggr` / `lmr-shy` | 50.0% / 48.3% | null |
+| `see-60` / `see-200` | 48.3% / 43.3% | both worse, confirms -110 is near optimal |
+
+`RFP_MARGIN` is the one sensitive constant found: 40 -> 61.7%, 75 -> 50%,
+120 -> 20%. A clean monotonic gradient saying lower is better. The direction is
+solid even though 61.7% on its own is not, so test values below 40 as well.
+
+LMR and LMP are insensitive, which together with an effective branching factor
+of 1.1-4.5 says pruning is otherwise exhausted. The sweep was stopped after
+eight of twelve variants; `delta-100`, `delta-350`, `fut-tight` and `fut-loose`
+were never run.
 
 ### Bugs found in rated games, all fixed
 
@@ -250,6 +266,62 @@ the ply it is meant to buy. Ordering-focused work, including history rework, has
 little headroom left given the measured branching factor.
 
 `docs/ENGINE_BRIEF.md` is a standalone version of this for outside review.
+
+---
+
+## TODO
+
+Ordered by expected value. Anything here that claims a gain has to survive a
+40 game arena against the current frozen baseline before it ships.
+
+### Next
+
+- [ ] **Confirm `RFP_MARGIN = 40`** with a second 40 game arena. 61.7% over 30
+      games is 1.5 SE, not enough on its own, but `rfp-120` at 20.0% makes the
+      direction clear. Also try 20 and 55 to find where the gradient turns.
+- [ ] **Finish the interrupted sweep**: `delta-100`, `delta-350`, `fut-tight`,
+      `fut-loose` were never run. `uv run python -m analysis.tune --all` then
+      arena each against `baselines/philbert-v14`.
+- [ ] **numba on `evaluate`, first half only**: material, PST and pawn
+      structure, which need no attack generation. Measure before attempting
+      mobility and king safety, which need sliding attacks reimplemented inside
+      numba and are where bugs would live. Spike numbers are in the profile
+      section; argument extraction at 4.01us is the floor.
+
+### After that
+
+- [ ] **Recapture and threat extensions.** Cheap, and aimed at the round 46
+      failure mode.
+- [ ] **Singular extensions.** Present in the 5x5 engine, never ported.
+      Contested; they may only pay from depth 10. One arena settles it.
+- [ ] **Fix and re-enable aspiration windows.** Two defects to repair first: the
+      re-search loop never checks the clock, and `search_root` accepts the move
+      returned by a fail low even though it is only an upper bound. Currently
+      off via `ASPIRATION_MIN_DEPTH = 999`.
+- [ ] **Incremental Zobrist.** Only ~8% now but grows once eval is jitted.
+      Needs a debug mode that recomputes and asserts, or it corrupts the
+      transposition table silently.
+
+### Ongoing
+
+- [ ] **Grow the scenario suite.** `kingsafety` has 2 positions and `endgame` 3.
+      Add a line to `analysis/positions.epd` after every rated game that shows a
+      weakness. Two suite expectations are unverified and may be wrong rather
+      than the engine: `take the opposition` prefers `e4` at +160 over `Ke2`,
+      and needs checking against a real endgame reference.
+- [ ] **Freeze a new baseline whenever a version ships**, so the next change is
+      measured against what it would actually replace.
+- [ ] **Read the per-game stderr log after every rated loss.** All three engine
+      bugs so far were found that way, not by local play.
+
+### Explicitly not doing
+
+- **ProbCut.** Forward pruning makes the search see less, so it cannot fix a
+  horizon problem. Last resort only, and only with full-search verification.
+- **NNUE-style evaluation.** A more expensive eval at 10k nps costs the ply it
+  is meant to buy.
+- **History and move-ordering rework.** The measured branching factor says
+  there is little headroom left.
 
 ---
 
