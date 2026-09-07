@@ -1,0 +1,27 @@
+# Scenario suite. One position per line:
+#   <fen> ; id "<name>" ; theme <tag> ; bm <move> | am <move>
+# bm = best move, the engine must find it. am = avoid move, it must not play it.
+# Add a line every time a rated game shows something the engine gets wrong.
+
+# --- material: does it see what a capture really costs -----------------------
+1k1r3q/1ppn3p/p4b2/4p3/8/P2N2P1/1PP1R1BP/2K1Q3 w - - 0 1 ; id "no Nxe5, battery behind" ; theme material ; am Nxe5
+4k3/8/5n2/3p4/8/8/3Q4/4K3 w - - 0 1 ; id "no Qxd5, defended" ; theme material ; am Qxd5
+4k3/8/8/3q4/8/4N3/8/4K3 w - - 0 1 ; id "take the free queen" ; theme material ; bm Nxd5
+
+# --- tactics -----------------------------------------------------------------
+r1bq2r1/b4pk1/p1pp1p2/1p2pP2/1P2P1PB/3P4/1PPQ2P1/R3K2R w KQ - 0 1 ; id "Qh6 sacrifice" ; theme tactics ; bm Qh6+
+6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1 ; id "back rank, seventh" ; theme tactics ; bm Ra8+
+2r3k1/5ppp/8/8/8/8/5PPP/2R3K1 w - - 0 1 ; id "contest the open file" ; theme tactics ; bm Rxc8+
+
+# --- king safety -------------------------------------------------------------
+r2q1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PP3PPP/R2Q1RK1 b - - 0 1 ; id "do not push g5" ; theme kingsafety ; am g5
+r2q1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PP3PPP/R2Q1RK1 b - - 0 1 ; id "do not push h5" ; theme kingsafety ; am h5
+
+# --- endgame -----------------------------------------------------------------
+8/8/8/8/8/5k2/5p2/5K2 b - - 0 1 ; id "do not stalemate, underpromote or wait" ; theme endgame ; am f1=Q
+8/5k2/8/8/8/8/4P3/4K3 w - - 0 1 ; id "take the opposition" ; theme endgame ; bm Ke2
+8/P6k/8/8/8/8/7K/8 w - - 0 1 ; id "promote" ; theme endgame ; bm a8=Q
+
+# --- regressions from our own rated games ------------------------------------
+# Round 46 move 15. Bc5 looks best until depth 9, then loses. Qb6 holds.
+r3kb1r/pp1b1ppp/4p3/3pP3/P2N1P2/3Q4/1qPBK1PP/R6R b kq - 3 15 ; id "r46: Bc5 loses, play Qb6" ; theme regression ; am Bc5
