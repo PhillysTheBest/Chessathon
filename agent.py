@@ -391,7 +391,7 @@ class Searcher:
         self.qnodes = 0
         self.seldepth = 0
         self.path = []  # zobrist keys along the current search path
-        self.game_keys = {}  # zobrist keys already played in the real game
+        self.game_keys = {}  # zobrist key -> times already played this game
 
     def check_time(self):
         # Only touch the clock every 1024 nodes; perf_counter is not free.
@@ -693,10 +693,17 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
     if ply > 0:
         if board.halfmove_clock >= 100 or board.is_insufficient_material():
             return 0
-        # A repeat inside the search path, or of a position already played in
-        # the real game, is a draw. The referee claims threefold automatically,
-        # so this is also what stops us shuffling a won game away.
-        if key in SEARCH.path or key in SEARCH.game_keys:
+        # A repeat inside the current line is a draw. So is a position the real
+        # game has already seen TWICE, since arriving again makes three and the
+        # referee claims threefold automatically.
+        #
+        # Counting matters. Treating a single earlier occurrence as a draw
+        # blinds the search completely: every root move whose child had been
+        # played before returned 0 without searching, so the engine could not
+        # tell a winning move from a losing one. Round 48 shuffled into a
+        # threefold that way, its last move reporting depth 64 on 64 nodes with
+        # quiescence never running once.
+        if key in SEARCH.path or SEARCH.game_keys.get(key, 0) >= 2:
             return 0
 
     if ply >= MAX_PLY - 1:
@@ -1108,7 +1115,7 @@ class OpponentTracker:
 
 
 TRACKER = OpponentTracker()
-GAME_KEYS: dict[int, bool] = {}
+GAME_KEYS: dict[int, int] = {}  # zobrist key -> occurrences this game
 
 # =============================================================================
 # TIME MANAGEMENT
@@ -1162,7 +1169,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
     try:
         their_move = TRACKER.observe(board)
 
-        GAME_KEYS[chess.polyglot.zobrist_hash(board)] = True
+        here = chess.polyglot.zobrist_hash(board)
+        GAME_KEYS[here] = GAME_KEYS.get(here, 0) + 1
         SEARCH.game_keys = GAME_KEYS
 
         soft_s, hard_s = compute_budget(board, time_left_ms)
@@ -1202,7 +1210,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
         after = board.copy(stack=False)
         after.push(move)
-        GAME_KEYS[chess.polyglot.zobrist_hash(after)] = True
+        after_key = chess.polyglot.zobrist_hash(after)
+        GAME_KEYS[after_key] = GAME_KEYS.get(after_key, 0) + 1
 
         if DEBUG:
             elapsed = (time.perf_counter() - call_start) * 1000
