@@ -25,3 +25,8 @@ r2q1rk1/pp2bppp/2n1pn2/3p4/3P4/2NBPN2/PP3PPP/R2Q1RK1 b - - 0 1 ; id "do not push
 # --- regressions from our own rated games ------------------------------------
 # Round 46 move 15. Bc5 looks best until depth 9, then loses. Qb6 holds.
 r3kb1r/pp1b1ppp/4p3/3pP3/P2N1P2/3Q4/1qPBK1PP/R6R b kq - 3 15 ; id "r46: Bc5 loses, play Qb6" ; theme regression ; am Bc5
+# Round 49 moves 49 and 52. No single blunder in that game; it lost by a run of
+# 50-110cp drifts. Unlike the round 46 case these are not depth-9 problems, so a
+# better tuned search should fix them.
+4b1k1/p1n2p2/1p3Ppr/1Pr1P3/2BR1K1p/N6P/8/6R1 w - - 7 49 ; id "r49 m49: Rg5 drops the bishop" ; theme regression ; am Rg5
+6k1/p2b1p2/1p2nPpr/1P2P1R1/2R3Kp/N6P/8/8 w - - 3 52 ; id "r49 m52: Nc2 drifts" ; theme regression ; am Nc2
