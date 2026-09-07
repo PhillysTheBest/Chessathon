@@ -275,6 +275,13 @@ KING_DANGER = [min(600, (units * units) // 20) for units in range(128)]
 # wrong scores degrade pruning.
 LAZY_MARGIN = 600
 
+# Quiescence discards captures whose SEE falls below this. Zero means "prune
+# every capture that loses material at all", which is the textbook setting and
+# is not obviously right here: at depth 5-6 the engine often cannot see the
+# compensation for a sacrifice, so pruning the move prunes the tactic. A more
+# negative value keeps speculative captures in the search.
+QS_SEE_THRESHOLD = 0
+
 MOBILITY_MG = [0, 0, 4, 4, 2, 1, 0]
 MOBILITY_EG = [0, 0, 4, 3, 4, 2, 0]
 
@@ -806,7 +813,7 @@ def qsearch(board, alpha, beta, ply):
             # is defended three times; playing the exchange out says whether
             # the capture actually wins material. A capture that loses material
             # cannot raise alpha, and quiescence is where most of the nodes are.
-            if see(board, move) < 0:
+            if see(board, move) < QS_SEE_THRESHOLD:
                 continue
 
         board.push(move)
