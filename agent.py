@@ -58,6 +58,13 @@ INCREMENT_MS = 500.0
 # loss. Under the increment the clock actually recovers.
 LOW_CLOCK_MS = 20000.0
 
+# Aspiration windows. After a few plies the root score is stable between
+# iterations, so a narrow guess around the last one is usually right and costs
+# far less than a full width search. Too narrow and the re-searches cost more
+# than the width saved.
+ASPIRATION_DELTA = 25
+ASPIRATION_MIN_DEPTH = 5
+
 TT_SIZE = 1 << 20
 TT_MASK = TT_SIZE - 1
 TT_EXACT, TT_LOWER, TT_UPPER = 0, 1, 2
@@ -1058,6 +1065,53 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
 # =============================================================================
 
 
+def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
+    """Search every root move once inside (alpha, beta).
+
+    Returns (move, score, finished, failed_high). A score at or below alpha is
+    a fail low and a score at or above beta a fail high; either means the window
+    was wrong and the caller has to widen it and come back.
+    """
+    iter_move = None
+    iter_score = -INFINITY
+    ordered = order_moves(board, root_moves, best_move, 0, None)
+
+    for index, move in enumerate(ordered):
+        board.push(move)
+        try:
+            if index == 0:
+                score = -negamax(board, depth - 1, -beta, -alpha, 1, move)
+            else:
+                score = -negamax(board, depth - 1, -alpha - 1, -alpha, 1, move)
+                if alpha < score < beta:
+                    score = -negamax(board, depth - 1, -beta, -alpha, 1, move)
+        except TimeUp:
+            return iter_move, iter_score, False, False
+        finally:
+            # Unwind to our own depth rather than popping once. When TimeUp is
+            # raised deep in the tree it propagates straight through the move
+            # loops in negamax and qsearch, which push before the recursive
+            # call and pop after it, so every frame in flight leaks its push.
+            # Popping once would leave the board several plies down, and every
+            # legality check and san() after this point would then be answering
+            # about the wrong position.
+            while len(board.move_stack) > base_stack:
+                board.pop()
+
+        if score > iter_score:
+            iter_score = score
+            iter_move = move
+            if score >= beta:
+                # Fail high. The score is only a lower bound, so searching the
+                # rest of the list under a window we already know is wrong buys
+                # nothing; widen and start again.
+                return iter_move, iter_score, True, True
+            if score > alpha:
+                alpha = score
+
+    return iter_move, iter_score, True, False
+
+
 def search_root(board, soft_s, hard_s):
     """Iterative deepening. Returns (move, score, depth, pv)."""
     start = time.perf_counter()
@@ -1080,53 +1134,43 @@ def search_root(board, soft_s, hard_s):
     pv = ""
     prev_score = None
     prev_move = None
+    last_iteration_nodes = 0
 
     # The root loop is explicit rather than deferred to negamax, so best_move
     # always comes from a search we actually ran. Reading it back out of the TT
     # instead is unsafe: buckets are indexed by key & TT_MASK, so a colliding
     # position can evict the root entry and leave a stale move behind.
     for depth in range(1, MAX_DEPTH_CAP + 1):
-        alpha = -INFINITY
-        beta = INFINITY
-        iter_move = None
-        iter_score = -INFINITY
-        finished = True
+        iteration_start_nodes = SEARCH.nodes
 
-        # Previous iteration's best goes first; that is most of what iterative
-        # deepening is for.
-        ordered = order_moves(board, root_moves, best_move, 0, None)
+        # Aspiration window. After a few plies the score barely moves between
+        # iterations, so searching the full width every time pays for a range
+        # the answer almost never uses. Guess narrow around the last score and
+        # widen only when the guess turns out wrong.
+        if (depth < ASPIRATION_MIN_DEPTH or prev_score is None
+                or abs(prev_score) > MATE_BOUND):
+            alpha, beta = -INFINITY, INFINITY
+            delta = 0
+        else:
+            delta = ASPIRATION_DELTA
+            alpha, beta = prev_score - delta, prev_score + delta
 
-        for index, move in enumerate(ordered):
-            board.push(move)
-            try:
-                if index == 0:
-                    score = -negamax(board, depth - 1, -beta, -alpha, 1, move)
-                else:
-                    score = -negamax(board, depth - 1, -alpha - 1, -alpha,
-                                     1, move)
-                    if alpha < score < beta:
-                        score = -negamax(board, depth - 1, -beta, -alpha,
-                                         1, move)
-            except TimeUp:
-                finished = False
+        while True:
+            iter_move, iter_score, finished, failed_high = _root_window(
+                board, root_moves, best_move, depth, alpha, beta, base_stack)
+            if not finished or delta == 0:
                 break
-            finally:
-                # Unwind to our own depth rather than popping once. When TimeUp
-                # is raised deep in the tree it propagates straight through
-                # negamax's and qsearch's move loops, which push before the
-                # recursive call and pop after it, so every frame in flight
-                # leaks its push. Popping once would leave the board sitting in
-                # some position several plies down, and every legality check
-                # and san() after this point would be answering about the wrong
-                # position.
-                while len(board.move_stack) > base_stack:
-                    board.pop()
-
-            if score > iter_score:
-                iter_score = score
-                iter_move = move
-                if score > alpha:
-                    alpha = score
+            if failed_high:
+                delta *= 2
+                beta = min(INFINITY, iter_score + delta)
+                continue
+            if iter_score <= alpha:
+                # Fail low: the position is worse than assumed. What comes back
+                # is an upper bound, so widen downwards and search again.
+                delta *= 2
+                alpha = max(-INFINITY, iter_score - delta)
+                continue
+            break
 
         # A partial iteration is still usable: the previous best was searched
         # first, so anything that beat it beat it on a real search.
@@ -1140,13 +1184,21 @@ def search_root(board, soft_s, hard_s):
         completed_depth = depth
         pv = _extract_pv(board, best_move, 8)
 
+        # Effective branching factor: what this ply cost against the last one.
+        # Perfect ordering in chess approaches sqrt(35), about 6, so a figure
+        # near 5 says ordering is healthy and one near 9 says it is not. Logged
+        # every move so rated games report it without any extra tooling.
+        nodes_before = last_iteration_nodes
+        last_iteration_nodes = SEARCH.nodes - iteration_start_nodes
+        ebf = last_iteration_nodes / nodes_before if nodes_before else 0.0
+
         if DEBUG:
             elapsed = time.perf_counter() - start
             nps = int(SEARCH.nodes / elapsed) if elapsed > 0 else 0
             print(
                 f"  depth {depth:2d} seldepth {SEARCH.seldepth:2d} "
                 f"score {_format_score(best_score)} nodes {SEARCH.nodes} "
-                f"nps {nps} time {elapsed * 1000:.0f}ms pv {pv}",
+                f"ebf {ebf:4.1f} nps {nps} time {elapsed * 1000:.0f}ms pv {pv}",
                 file=sys.stderr,
             )
 
