@@ -58,12 +58,22 @@ INCREMENT_MS = 500.0
 # loss. Under the increment the clock actually recovers.
 LOW_CLOCK_MS = 20000.0
 
-# Aspiration windows. After a few plies the root score is stable between
-# iterations, so a narrow guess around the last one is usually right and costs
-# far less than a full width search. Too narrow and the re-searches cost more
-# than the width saved.
+# Aspiration windows, DISABLED. The idea is sound and the node saving was real,
+# 289804 -> 244629 nodes to reach depth 8, but it lost the arena that matters:
+# +12 =10 -18 against philbert-v14 over 40 games, 42.5%, and one of those games
+# was lost by flagging.
+#
+# The flag says the implementation is wrong rather than the idea. A fail low
+# re-searches with a wider window, and nothing checks the clock between those
+# re-searches, so a single ply can consume the rest of the budget. Worse, the
+# move that comes back from a fail low is only an upper bound and search_root
+# accepts it anyway.
+#
+# Setting the minimum depth above MAX_DEPTH_CAP disables it while leaving the
+# code and the measurement in place. Re-enable only after the re-search loop
+# respects the deadline and refuses to take a move from a failed window.
 ASPIRATION_DELTA = 25
-ASPIRATION_MIN_DEPTH = 5
+ASPIRATION_MIN_DEPTH = 999
 
 TT_SIZE = 1 << 20
 TT_MASK = TT_SIZE - 1
