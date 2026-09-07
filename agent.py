@@ -264,6 +264,17 @@ KING_ATTACK_WEIGHT = [0, 0, 20, 20, 40, 80, 0]
 # Danger grows faster than linearly: two attackers are worth far more than one.
 KING_DANGER = [min(600, (units * units) // 20) for units in range(128)]
 
+# How far outside the caller's window pass 1 must land before pass 2 is
+# skipped. This has to exceed everything the positional terms can contribute,
+# or the search sees evaluations that are simply wrong. Measured over 1500
+# random positions the positional swing was a median of 35cp, p99.9 of 385 and
+# a maximum of 456, so 600 leaves real headroom. It is worth about 5-8% and,
+# importantly, leaves the node count unchanged: at this margin the cut only
+# fires where the full evaluation could not have changed the outcome. Lowering
+# it to 240 looks 17% faster and is not - it searches MORE nodes, because the
+# wrong scores degrade pruning.
+LAZY_MARGIN = 600
+
 MOBILITY_MG = [0, 0, 4, 4, 2, 1, 0]
 MOBILITY_EG = [0, 0, 4, 3, 4, 2, 0]
 
@@ -406,38 +417,31 @@ SEARCH = Searcher()
 # =============================================================================
 
 
-def evaluate(board):
-    """Static evaluation in centipawns, from the side to move's point of view."""
+def evaluate(board, alpha=-INFINITY, beta=INFINITY):
+    """Static evaluation in centipawns, from the side to move's point of view.
+
+    Two passes. The first is material, piece-square tables and the bishop pair,
+    which is cheap and accounts for nearly all of the score in nearly every
+    position. If that alone already sits a full LAZY_MARGIN outside the window
+    the caller cares about, no amount of positional detail will drag it back
+    in, so the second pass is skipped. Quiescence makes almost every evaluate
+    call in the search and cuts on stand-pat most of the time, which is exactly
+    the case this is for.
+
+    Passing no window forces the full evaluation.
+    """
+    white = board.occupied_co[chess.WHITE]
+    black = board.occupied_co[chess.BLACK]
+    white_pawns = board.pawns & white
+    black_pawns = board.pawns & black
+
     mg = 0
     eg = 0
     phase = 0
 
-    white_pawns = board.pawns & board.occupied_co[chess.WHITE]
-    black_pawns = board.pawns & board.occupied_co[chess.BLACK]
-
-    # Zone around each king, held as the zone its OPPONENT is attacking.
-    # Skipped when the attacker has no queen: a king hunt without one almost
-    # never breaks through, and dropping the term there costs nothing and buys
-    # back most of what king safety spends in queenless positions.
-    kings = board.kings
-    queens = board.queens
-    white_king_bb = kings & board.occupied_co[chess.WHITE]
-    black_king_bb = kings & board.occupied_co[chess.BLACK]
-    zone_of = [0, 0]
-    if black_king_bb and queens & board.occupied_co[chess.WHITE]:
-        zone_of[chess.WHITE] = KING_ZONE[chess.BLACK][black_king_bb.bit_length() - 1]
-    if white_king_bb and queens & board.occupied_co[chess.BLACK]:
-        zone_of[chess.BLACK] = KING_ZONE[chess.WHITE][white_king_bb.bit_length() - 1]
-    attack_units = [0, 0]
-
+    # ---- pass 1: material, PST, bishop pair -------------------------------
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color else -1
-        own = board.occupied_co[color]
-        own_pawns = white_pawns if color else black_pawns
-        their_pawns = black_pawns if color else white_pawns
-        # The zone around the king we are attacking.
-        target_zone = zone_of[color]
-
         pst_mg = PST_MG[color]
         pst_eg = PST_EG[color]
 
@@ -452,71 +456,111 @@ def evaluate(board):
             mg += sign * PIECE_VALUE_MG[piece_type] * count
             eg += sign * PIECE_VALUE_EG[piece_type] * count
 
+            if piece_type == chess.BISHOP and count >= 2:
+                mg += sign * BISHOP_PAIR_MG
+                eg += sign * BISHOP_PAIR_EG
+
             table_mg = pst_mg[piece_type]
             table_eg = pst_eg[piece_type]
-            mobile = piece_type in (chess.KNIGHT, chess.BISHOP,
-                                    chess.ROOK, chess.QUEEN)
-
+            sum_mg = 0
+            sum_eg = 0
             for square in chess.scan_forward(bb):
-                mg += sign * table_mg[square]
-                eg += sign * table_eg[square]
+                sum_mg += table_mg[square]
+                sum_eg += table_eg[square]
+            mg += sign * sum_mg
+            eg += sign * sum_eg
 
-                if piece_type == chess.PAWN:
-                    # Doubled: another friendly pawn ahead on the same file.
-                    if FRONT_FILE[color][square] & own_pawns:
-                        mg += sign * DOUBLED_MG
-                        eg += sign * DOUBLED_EG
-                    # Isolated: no friendly pawn on either adjacent file.
-                    if not (ADJACENT_FILES[chess.square_file(square)] & own_pawns):
-                        mg += sign * ISOLATED_MG
-                        eg += sign * ISOLATED_EG
-                    # Passed: no enemy pawn anywhere in the forward span.
-                    if not (PASSED_MASK[color][square] & their_pawns):
-                        rank = chess.square_rank(square)
-                        advance = rank if color else 7 - rank
-                        mg += sign * PASSED_MG[advance]
-                        eg += sign * PASSED_EG[advance]
+    if phase > MAX_PHASE:
+        phase = MAX_PHASE
 
-                elif piece_type == chess.ROOK:
-                    file_bb = chess.BB_FILES[chess.square_file(square)]
-                    if not (file_bb & own_pawns):
-                        if file_bb & their_pawns:
-                            mg += sign * ROOK_SEMI_MG
-                            eg += sign * ROOK_SEMI_EG
-                        else:
-                            mg += sign * ROOK_OPEN_MG
-                            eg += sign * ROOK_OPEN_EG
+    white_to_move = board.turn == chess.WHITE
+    lazy = (mg * phase + eg * (MAX_PHASE - phase)) // MAX_PHASE
+    lazy += TEMPO if white_to_move else -TEMPO
+    if not white_to_move:
+        lazy = -lazy
 
-                elif piece_type == chess.KING:
-                    shield = (KING_SHIELD[color][square] & own_pawns).bit_count()
-                    mg += sign * KING_SHIELD_MG * shield
-                    # An open or half-open file beside the king is the road an
-                    # attack travels down. Pushing the pawn in front of your
-                    # own king should cost more than the tempo it buys.
-                    for file_bb in KING_FILES[square]:
-                        if not (file_bb & own_pawns):
-                            mg += sign * (
-                                KING_SEMI_FILE_MG if file_bb & their_pawns
-                                else KING_OPEN_FILE_MG
-                            )
+    if lazy - LAZY_MARGIN >= beta or lazy + LAZY_MARGIN <= alpha:
+        return lazy
 
-                if mobile:
-                    attacked = board.attacks_mask(square)
-                    moves = (attacked & ~own).bit_count()
-                    mg += sign * MOBILITY_MG[piece_type] * moves
-                    eg += sign * MOBILITY_EG[piece_type] * moves
-                    # Same mask, reused: how much of the enemy king's zone this
-                    # piece covers. Nearly free, since attacks_mask is already
-                    # paid for by the mobility term.
-                    if target_zone:
-                        hits = (attacked & target_zone).bit_count()
-                        if hits:
-                            attack_units[color] += (
-                                KING_ATTACK_WEIGHT[piece_type] * hits)
+    # ---- pass 2: the positional terms -------------------------------------
+    # Zone around each king, held as the zone its OPPONENT is attacking.
+    # Skipped when the attacker has no queen: a king hunt without one almost
+    # never breaks through, and dropping the term there costs nothing and buys
+    # back most of what king safety spends in queenless positions.
+    kings = board.kings
+    queens = board.queens
+    white_king_bb = kings & white
+    black_king_bb = kings & black
+    zone_of = [0, 0]
+    if black_king_bb and queens & white:
+        zone_of[chess.WHITE] = KING_ZONE[chess.BLACK][black_king_bb.bit_length() - 1]
+    if white_king_bb and queens & black:
+        zone_of[chess.BLACK] = KING_ZONE[chess.WHITE][white_king_bb.bit_length() - 1]
+    attack_units = [0, 0]
 
-        if board.pieces_mask(chess.BISHOP, color).bit_count() >= 2:
-            mg += sign * BISHOP_PAIR_MG
-            eg += sign * BISHOP_PAIR_EG
+    for color in (chess.WHITE, chess.BLACK):
+        sign = 1 if color else -1
+        own = white if color else black
+        own_pawns = white_pawns if color else black_pawns
+        their_pawns = black_pawns if color else white_pawns
+        # The zone around the king we are attacking.
+        target_zone = zone_of[color]
+
+        for square in chess.scan_forward(own_pawns):
+            # Doubled: another friendly pawn ahead on the same file.
+            if FRONT_FILE[color][square] & own_pawns:
+                mg += sign * DOUBLED_MG
+                eg += sign * DOUBLED_EG
+            # Isolated: no friendly pawn on either adjacent file.
+            if not (ADJACENT_FILES[chess.square_file(square)] & own_pawns):
+                mg += sign * ISOLATED_MG
+                eg += sign * ISOLATED_EG
+            # Passed: no enemy pawn anywhere in the forward span.
+            if not (PASSED_MASK[color][square] & their_pawns):
+                rank = chess.square_rank(square)
+                advance = rank if color else 7 - rank
+                mg += sign * PASSED_MG[advance]
+                eg += sign * PASSED_EG[advance]
+
+        for square in chess.scan_forward(board.rooks & own):
+            file_bb = chess.BB_FILES[chess.square_file(square)]
+            if not (file_bb & own_pawns):
+                if file_bb & their_pawns:
+                    mg += sign * ROOK_SEMI_MG
+                    eg += sign * ROOK_SEMI_EG
+                else:
+                    mg += sign * ROOK_OPEN_MG
+                    eg += sign * ROOK_OPEN_EG
+
+        for square in chess.scan_forward(kings & own):
+            shield = (KING_SHIELD[color][square] & own_pawns).bit_count()
+            mg += sign * KING_SHIELD_MG * shield
+            # An open or half-open file beside the king is the road an attack
+            # travels down. Pushing the pawn in front of your own king should
+            # cost more than the tempo it buys.
+            for file_bb in KING_FILES[square]:
+                if not (file_bb & own_pawns):
+                    mg += sign * (
+                        KING_SEMI_FILE_MG if file_bb & their_pawns
+                        else KING_OPEN_FILE_MG
+                    )
+
+        for piece_type in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+            weight_mg = MOBILITY_MG[piece_type]
+            weight_eg = MOBILITY_EG[piece_type]
+            attack_weight = KING_ATTACK_WEIGHT[piece_type]
+            for square in chess.scan_forward(board.pieces_mask(piece_type, color)):
+                attacked = board.attacks_mask(square)
+                moves = (attacked & ~own).bit_count()
+                mg += sign * weight_mg * moves
+                eg += sign * weight_eg * moves
+                # Same mask, reused: how much of the enemy king's zone this
+                # piece covers. Nearly free, since attacks_mask is already paid
+                # for by the mobility term.
+                if target_zone:
+                    hits = (attacked & target_zone).bit_count()
+                    if hits:
+                        attack_units[color] += attack_weight * hits
 
     # King danger is a midgame term only: with the queens off, a king in the
     # open is an asset, not a liability, and the endgame PSTs already say so.
@@ -524,12 +568,10 @@ def evaluate(board):
            - KING_DANGER[min(attack_units[chess.BLACK] // 8, 127)])
 
     # Taper between the midgame and endgame scores.
-    if phase > MAX_PHASE:
-        phase = MAX_PHASE
     score = (mg * phase + eg * (MAX_PHASE - phase)) // MAX_PHASE
-    score += TEMPO if board.turn == chess.WHITE else -TEMPO
+    score += TEMPO if white_to_move else -TEMPO
 
-    return score if board.turn == chess.WHITE else -score
+    return score if white_to_move else -score
 
 
 def game_phase(board):
@@ -611,6 +653,103 @@ def order_captures(board, moves):
 
 
 # =============================================================================
+# STATIC EXCHANGE EVALUATION
+# =============================================================================
+# What MVV-LVA cannot tell you: whether a capture actually WINS material once
+# the recapture sequence plays out. MVV-LVA sorts NxQ above everything, even
+# when the queen is defended three times and the knight is lost for nothing.
+# SEE plays the exchange out on one square, always recapturing with the
+# cheapest available attacker, and returns the material balance.
+#
+# The 5x5 engine leaned on _cap_order alone. On 8x8 there are far more sliding
+# pieces and far more batteries behind them, so "is this capture safe" stops
+# being obvious from the two pieces involved.
+
+SEE_VALUE = [0, 100, 325, 335, 500, 975, 20000]
+
+
+def _least_valuable(board, attackers, color):
+    """Cheapest attacker of `color` in `attackers`, as (square, piece_type)."""
+    for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP,
+                       chess.ROOK, chess.QUEEN, chess.KING):
+        subset = attackers & board.pieces_mask(piece_type, color)
+        if subset:
+            return subset.bit_length() - 1, piece_type
+    return None, None
+
+
+def see(board, move):
+    """Material won by `move` in centipawns, assuming best play by both sides.
+
+    Negative means the exchange loses material. Promotions and en passant are
+    approximated: the point is ordering and pruning, not exactness.
+
+    Pins are ignored, because attackers_mask does not know about them, so a
+    defender that cannot legally recapture is still counted. Checked against a
+    brute-force minimax of the exchange over 1083 captures from 300 random
+    positions: 2 disagreements, both pins. That is the usual trade and the
+    usual error rate; resolving pins here would cost more than it saves.
+    """
+    target = move.to_square
+    from_square = move.from_square
+
+    captured = board.piece_type_at(target)
+    if captured is None:
+        captured = chess.PAWN if board.is_en_passant(move) else 0
+
+    attacker = board.piece_type_at(from_square)
+    if attacker is None:
+        return 0
+
+    # gain[i] is the material balance after i captures, from the mover's view.
+    gain = [SEE_VALUE[captured] if captured else 0]
+
+    occupied = board.occupied & ~chess.BB_SQUARES[from_square]
+    if board.is_en_passant(move):
+        captured_square = target + (-8 if board.turn == chess.WHITE else 8)
+        occupied &= ~chess.BB_SQUARES[captured_square]
+
+    # Every piece bearing on the square, recomputed as the square is vacated so
+    # a rook behind a rook joins the exchange when the front one takes.
+    attackers = board.attackers_mask(chess.WHITE, target, occupied) | \
+        board.attackers_mask(chess.BLACK, target, occupied)
+    attackers &= occupied
+
+    side = not board.turn
+    on_square = attacker
+    depth = 0
+
+    while True:
+        square, piece_type = _least_valuable(
+            board, attackers & board.occupied_co[side], side)
+        if square is None:
+            break
+
+        depth += 1
+        # Standing on the square is worth what we just took, minus whatever the
+        # opponent can win back by continuing.
+        gain.append(SEE_VALUE[on_square] - gain[depth - 1])
+
+        # No early exit here. The classic SEE pruning test is unsound the way
+        # this loop is folded back: on a battery it stops one capture short and
+        # reported Nxe5 in 1k1r3q/1ppn3p/p4b2/4p3/8/P2N2P1/1PP1R1BP/2K1Q3 as
+        # -65 when the true value is -225. Exchanges are short; play them out.
+        on_square = piece_type
+        occupied &= ~chess.BB_SQUARES[square]
+        attackers = (board.attackers_mask(chess.WHITE, target, occupied)
+                     | board.attackers_mask(chess.BLACK, target, occupied))
+        attackers &= occupied
+        side = not side
+
+    # Fold back: at each step the side to move may decline the capture.
+    while depth:
+        gain[depth - 1] = -max(-gain[depth - 1], gain[depth])
+        depth -= 1
+
+    return gain[0]
+
+
+# =============================================================================
 # QUIESCENCE
 # =============================================================================
 
@@ -638,7 +777,7 @@ def qsearch(board, alpha, beta, ply):
         moves = order_moves(board, moves, None, ply, None)
         best = -INFINITY
     else:
-        stand_pat = evaluate(board)
+        stand_pat = evaluate(board, alpha, beta)
         if stand_pat >= beta:
             return stand_pat
         if stand_pat > alpha:
