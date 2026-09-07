@@ -53,6 +53,10 @@ INFINITY = 1 << 30
 # every budget below is clamped against SAFETY_MARGIN_MS before it is used.
 SAFETY_MARGIN_MS = 250.0
 INCREMENT_MS = 500.0
+# Below this the clock decides the budget, not the position. A third of a two
+# second clock per move is how a playable game becomes a flag, and a flag is a
+# loss. Under the increment the clock actually recovers.
+LOW_CLOCK_MS = 20000.0
 
 TT_SIZE = 1 << 20
 TT_MASK = TT_SIZE - 1
@@ -1140,6 +1144,15 @@ def compute_budget(board, time_left_ms):
     soft_ms = time_left_ms / expected_left + INCREMENT_MS * 0.7
     soft_ms = min(soft_ms, time_left_ms * 0.20)
     hard_ms = min(soft_ms * 3.0, time_left_ms * 0.33)
+
+    # Time trouble overrides everything above. Round 49 reached move 74 with
+    # 3.6s left, still handing itself 845ms of a 2560ms clock; at 0.8x the
+    # increment plus a sliver, the increment outpaces the spend and the clock
+    # climbs back instead of draining.
+    if time_left_ms < LOW_CLOCK_MS:
+        cap = INCREMENT_MS * 0.8 + time_left_ms * 0.02
+        soft_ms = min(soft_ms, cap)
+        hard_ms = min(hard_ms, cap * 1.6)
 
     ceiling = max(20.0, time_left_ms - SAFETY_MARGIN_MS)
     hard_ms = max(20.0, min(hard_ms, ceiling))
