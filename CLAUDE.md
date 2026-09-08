@@ -158,6 +158,7 @@ rewritten, so an arena result attributes cleanly to one constant.
 | v1.4 over v1.3 — lazy eval + SEE at threshold −110 | **70.0%** |
 | v1.6 over v1.5 — TT/check-extension depth fix, qsearch draw detection | safety fixes, sanity-checked only (12 games, 50.0%) |
 | v1.7 over v1.6 — staged TT-move-first search | inconclusive: 43.8% over 40 games, within noise; kept, not reverted |
+| v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast clock 51.2%/40 games (noise, expected — see below); realistic-clock confirmation pending |
 
 `submission.zip` should be built from a version that has beaten the one on the
 ladder. As of the last session that is **v1.4**.
@@ -316,9 +317,12 @@ any winner at `--base-ms 120000 --increment-ms 500`** before it ships, since
 the fast clock and the realistic clock are now known to reach different
 depths.
 
-- [ ] **Confirm `RFP_MARGIN = 40`** with a second 40 game arena. 61.7% over 30
-      games is 1.5 SE, not enough on its own, but `rfp-120` at 20.0% makes the
-      direction clear. Also try 20 and 55 to find where the gradient turns.
+- [x] **Confirm `RFP_MARGIN = 40`** — done, did not confirm. 52.5% over 40
+      games against `v17` (+18 =6 -16), within noise. The earlier 61.7%/30
+      games was measured against a much older baseline before both the
+      TT/qsearch fixes and the staged-move-gen change; whatever signal that
+      had did not survive. `RFP_MARGIN` stays at 75. Not worth pursuing 20/55
+      further given this.
 - [ ] **Finish the interrupted sweep**: `delta-100`, `delta-350`, `fut-tight`,
       `fut-loose` were never run. `uv run python -m analysis.tune --all` then
       arena each. Note before concluding anything: `DELTA_MARGIN` and
@@ -345,12 +349,16 @@ behavior, so it needed the same arena treatment as everything else. 43.8% over
 40 games against v16, within noise; kept rather than reverted since there
 were no correctness defects.
 
-- [ ] **numba on `evaluate`, first half only**: material, PST and pawn
-      structure, which need no attack generation. Measure before attempting
-      mobility and king safety, which need sliding attacks reimplemented inside
-      numba and are where bugs would live. Spike numbers are in the profile
-      section; argument extraction at 4.01us is the floor. `baselines/numba/`
-      already has an `@njit(cache=False)` precedent to follow.
+- [x] **numba on `evaluate`, first half only** — done, shipped as v1.8. Jitted
+      material/PST/bishop pair only; mobility/king safety stay pure Python, as
+      planned. 3000-position parity check against the old loop: zero
+      mismatches. Self-play NPS ~24k, up from the 9-11k baseline (also
+      reflects v1.7's staged-move-gen). Fast-clock arena vs v17 was noise
+      (51.2%/40 games), which is expected — the fast clock caps depth at 3-4,
+      where an NPS gain is least likely to convert into a full extra ply.
+      Realistic-clock confirmation is the real test; see the result once it's
+      in. Mobility/king-safety jitting (needs sliding attacks reimplemented in
+      numba) is still open and still the highest-risk half.
 
 ### After that
 
