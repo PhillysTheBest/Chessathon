@@ -709,6 +709,35 @@ def _jit_mobility(bitboards, occupied, own_occ, target_zone,
     return mg, eg, au_black, au_white
 
 
+def _piece_bitboards(board):
+    """(2, 7) uint64 array, bitboards[color][piece_type]: colors matching
+    int(chess.BLACK)=0 / int(chess.WHITE)=1, piece types matching
+    chess.PAWN..chess.KING (1..6). Shared by evaluate() and see() - both feed
+    a board into jitted code in this shape, and building it by hand twice is
+    exactly the kind of place a transcription bug likes to hide (a bare
+    True/False used as a numpy index is boolean masking, not integer
+    indexing, and raises a confusingly-shaped IndexError - see below).
+    """
+    white = board.occupied_co[chess.WHITE]
+    black = board.occupied_co[chess.BLACK]
+    bitboards = np.empty((2, 7), dtype=np.uint64)
+    black_row = bitboards[0]
+    white_row = bitboards[1]
+    black_row[chess.PAWN] = board.pawns & black
+    white_row[chess.PAWN] = board.pawns & white
+    black_row[chess.KNIGHT] = board.knights & black
+    white_row[chess.KNIGHT] = board.knights & white
+    black_row[chess.BISHOP] = board.bishops & black
+    white_row[chess.BISHOP] = board.bishops & white
+    black_row[chess.ROOK] = board.rooks & black
+    white_row[chess.ROOK] = board.rooks & white
+    black_row[chess.QUEEN] = board.queens & black
+    white_row[chess.QUEEN] = board.queens & white
+    black_row[chess.KING] = board.kings & black
+    white_row[chess.KING] = board.kings & white
+    return bitboards
+
+
 def evaluate(board, alpha=-INFINITY, beta=INFINITY):
     """Static evaluation in centipawns, from the side to move's point of view.
 
@@ -728,26 +757,7 @@ def evaluate(board, alpha=-INFINITY, beta=INFINITY):
     black_pawns = board.pawns & black
 
     # ---- pass 1: material, PST, bishop pair (jitted) -----------------------
-    # bitboards[0] is Black's row and bitboards[1] White's, matching
-    # int(chess.BLACK)/int(chess.WHITE) - plain 0/1 indices, not the bool
-    # constants themselves. A bare True/False in a numpy index tuple is
-    # boolean masking, not integer indexing, and raises exactly this
-    # confusingly-shaped IndexError.
-    bitboards = np.empty((2, 7), dtype=np.uint64)
-    black_row = bitboards[0]
-    white_row = bitboards[1]
-    black_row[chess.PAWN] = black_pawns
-    white_row[chess.PAWN] = white_pawns
-    black_row[chess.KNIGHT] = board.knights & black
-    white_row[chess.KNIGHT] = board.knights & white
-    black_row[chess.BISHOP] = board.bishops & black
-    white_row[chess.BISHOP] = board.bishops & white
-    black_row[chess.ROOK] = board.rooks & black
-    white_row[chess.ROOK] = board.rooks & white
-    black_row[chess.QUEEN] = board.queens & black
-    white_row[chess.QUEEN] = board.queens & white
-    black_row[chess.KING] = board.kings & black
-    white_row[chess.KING] = board.kings & white
+    bitboards = _piece_bitboards(board)
 
     mg, eg, phase = _jit_material_pst(
         bitboards, PST_MG_NP, PST_EG_NP, PIECE_VALUE_MG_NP, PIECE_VALUE_EG_NP,
@@ -958,16 +968,129 @@ def order_captures(board, moves):
 # being obvious from the two pieces involved.
 
 SEE_VALUE = [0, 100, 325, 335, 500, 975, 20000]
+SEE_VALUE_NP = np.array(SEE_VALUE, dtype=np.int64)
+
+# A board holds at most 32 pieces, so an exchange sequence on one square can
+# never involve more captures than that; 40 leaves headroom without
+# meaning anything more precise than "clearly enough".
+SEE_MAX_DEPTH = 40
+
+# PAWN_ATTACKS_NP[color][square]: squares a pawn of `color` standing on
+# `square` attacks. Taken directly from python-chess's own BB_PAWN_ATTACKS
+# (indexed [chess.BLACK, chess.WHITE] = [0, 1], matching every other color
+# index in this file) rather than re-derived - one less place for a
+# transcription bug to live, same reasoning as KNIGHT_ATTACKS_NP above.
+PAWN_ATTACKS_NP = np.array(
+    [[int(bb) for bb in chess.BB_PAWN_ATTACKS[color]]
+     for color in (chess.BLACK, chess.WHITE)],
+    dtype=np.uint64,
+)
+KING_ATTACKS_NP = np.array([int(bb) for bb in chess.BB_KING_ATTACKS], dtype=np.uint64)
 
 
-def _least_valuable(board, attackers, color):
-    """Cheapest attacker of `color` in `attackers`, as (square, piece_type)."""
-    for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP,
-                       chess.ROOK, chess.QUEEN, chess.KING):
-        subset = attackers & board.pieces_mask(piece_type, color)
+@njit(cache=False)
+def _jit_attackers_to(target, occupied, white_pawns, black_pawns, all_knights,
+                       all_kings, all_bishops_queens, all_rooks_queens,
+                       pawn_attacks, king_attacks, knight_attacks):
+    """Combined white+black attacker bitboard of `target` under `occupied`.
+    Mirrors board.attackers_mask(WHITE, ...) | board.attackers_mask(BLACK,
+    ...) - including its final "& occupied", which is what lets a piece
+    whose square has been vacated (captured earlier in the same exchange)
+    drop out regardless of piece type, not just for sliding pieces.
+    """
+    attackers = pawn_attacks[0, target] & white_pawns
+    attackers |= pawn_attacks[1, target] & black_pawns
+    attackers |= knight_attacks[target] & all_knights
+    attackers |= king_attacks[target] & all_kings
+    attackers |= _diag_attacks_jit(target, occupied) & all_bishops_queens
+    attackers |= _orth_attacks_jit(target, occupied) & all_rooks_queens
+    return attackers & occupied
+
+
+@njit(cache=False)
+def _jit_least_valuable(attackers, bitboards, side):
+    """Cheapest attacker of `side` in `attackers`, as (square, piece_type), or
+    (-1, 0) if none. Ties (two attackers of the same type) resolve to the
+    lowest-indexed square rather than _least_valuable's old highest-indexed
+    one; harmless, since same-type attackers carry the same SEE value and the
+    other one stays in `attackers` for the next iteration either way - see
+    the Phase B parity check before trusting that claim further than this
+    comment does.
+    """
+    one = np.uint64(1)
+    for piece_type in range(1, 7):
+        subset = attackers & bitboards[side, piece_type]
         if subset:
-            return subset.bit_length() - 1, piece_type
-    return None, None
+            lsb = subset & (-subset)
+            square = 0
+            temp = lsb
+            while temp > one:
+                temp >>= one
+                square += 1
+            return square, piece_type
+    return -1, 0
+
+
+@njit(cache=False)
+def _jit_see(bitboards, occupied, from_square, target, side_to_move, captured,
+             attacker, ep_square, see_value, pawn_attacks, king_attacks,
+             knight_attacks):
+    """Numba twin of the exchange loop see() used to run in pure Python.
+    side_to_move is the mover's color (1=white, 0=black, matching bitboards'
+    own color index). ep_square is the extra pawn square to vacate for an en
+    passant capture, or -1. No early exit - see the note this carries over
+    from the pre-jit version: the classic SEE pruning test is unsound the way
+    this loop is folded back, and stopping early once mis-scored a battery
+    position by 160cp.
+    """
+    one = np.uint64(1)
+    gain = np.zeros(SEE_MAX_DEPTH, dtype=np.int64)
+    gain[0] = see_value[captured] if captured else 0
+
+    occ = occupied & ~(one << np.uint64(from_square))
+    if ep_square >= 0:
+        occ &= ~(one << np.uint64(ep_square))
+
+    white_pawns = bitboards[1, 1]
+    black_pawns = bitboards[0, 1]
+    all_knights = bitboards[0, 2] | bitboards[1, 2]
+    all_bishops_queens = bitboards[0, 3] | bitboards[1, 3] | bitboards[0, 5] | bitboards[1, 5]
+    all_rooks_queens = bitboards[0, 4] | bitboards[1, 4] | bitboards[0, 5] | bitboards[1, 5]
+    all_kings = bitboards[0, 6] | bitboards[1, 6]
+
+    attackers = _jit_attackers_to(
+        target, occ, white_pawns, black_pawns, all_knights, all_kings,
+        all_bishops_queens, all_rooks_queens, pawn_attacks, king_attacks,
+        knight_attacks)
+
+    side = 1 - side_to_move
+    on_square = attacker
+    depth = 0
+
+    while depth < SEE_MAX_DEPTH - 1:
+        square, piece_type = _jit_least_valuable(attackers, bitboards, side)
+        if square < 0:
+            break
+
+        depth += 1
+        # Standing on the square is worth what we just took, minus whatever
+        # the opponent can win back by continuing.
+        gain[depth] = see_value[on_square] - gain[depth - 1]
+
+        on_square = piece_type
+        occ &= ~(one << np.uint64(square))
+        attackers = _jit_attackers_to(
+            target, occ, white_pawns, black_pawns, all_knights, all_kings,
+            all_bishops_queens, all_rooks_queens, pawn_attacks, king_attacks,
+            knight_attacks)
+        side = 1 - side
+
+    # Fold back: at each step the side to move may decline the capture.
+    while depth:
+        gain[depth - 1] = -max(-gain[depth - 1], gain[depth])
+        depth -= 1
+
+    return gain[0]
 
 
 def see(board, move):
@@ -981,6 +1104,9 @@ def see(board, move):
     brute-force minimax of the exchange over 1083 captures from 300 random
     positions: 2 disagreements, both pins. That is the usual trade and the
     usual error rate; resolving pins here would cost more than it saves.
+
+    The exchange loop itself runs jitted (_jit_see) - this wrapper only
+    builds the primitive inputs it needs from `board`.
     """
     target = move.to_square
     from_square = move.from_square
@@ -993,52 +1119,18 @@ def see(board, move):
     if attacker is None:
         return 0
 
-    # gain[i] is the material balance after i captures, from the mover's view.
-    gain = [SEE_VALUE[captured] if captured else 0]
-
-    occupied = board.occupied & ~chess.BB_SQUARES[from_square]
+    ep_square = -1
     if board.is_en_passant(move):
-        captured_square = target + (-8 if board.turn == chess.WHITE else 8)
-        occupied &= ~chess.BB_SQUARES[captured_square]
+        ep_square = target + (-8 if board.turn == chess.WHITE else 8)
 
-    # Every piece bearing on the square, recomputed as the square is vacated so
-    # a rook behind a rook joins the exchange when the front one takes.
-    attackers = board.attackers_mask(chess.WHITE, target, occupied) | \
-        board.attackers_mask(chess.BLACK, target, occupied)
-    attackers &= occupied
+    bitboards = _piece_bitboards(board)
+    side_to_move = 1 if board.turn else 0
 
-    side = not board.turn
-    on_square = attacker
-    depth = 0
-
-    while True:
-        square, piece_type = _least_valuable(
-            board, attackers & board.occupied_co[side], side)
-        if square is None:
-            break
-
-        depth += 1
-        # Standing on the square is worth what we just took, minus whatever the
-        # opponent can win back by continuing.
-        gain.append(SEE_VALUE[on_square] - gain[depth - 1])
-
-        # No early exit here. The classic SEE pruning test is unsound the way
-        # this loop is folded back: on a battery it stops one capture short and
-        # reported Nxe5 in 1k1r3q/1ppn3p/p4b2/4p3/8/P2N2P1/1PP1R1BP/2K1Q3 as
-        # -65 when the true value is -225. Exchanges are short; play them out.
-        on_square = piece_type
-        occupied &= ~chess.BB_SQUARES[square]
-        attackers = (board.attackers_mask(chess.WHITE, target, occupied)
-                     | board.attackers_mask(chess.BLACK, target, occupied))
-        attackers &= occupied
-        side = not side
-
-    # Fold back: at each step the side to move may decline the capture.
-    while depth:
-        gain[depth - 1] = -max(-gain[depth - 1], gain[depth])
-        depth -= 1
-
-    return gain[0]
+    return int(_jit_see(
+        bitboards, np.uint64(board.occupied), from_square, target,
+        side_to_move, captured, attacker, ep_square, SEE_VALUE_NP,
+        PAWN_ATTACKS_NP, KING_ATTACKS_NP, KNIGHT_ATTACKS_NP,
+    ))
 
 
 # =============================================================================
