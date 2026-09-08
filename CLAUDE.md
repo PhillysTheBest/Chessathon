@@ -496,6 +496,47 @@ original game's search reached at an earlier move (round 72: 1 mismatch;
 round 74: 13, in a much sharper game), so a replayed trace is informative,
 not a certified reconstruction of what the original tournament run computed.
 
+**The four-loss evidence table.** Before reverting the recapture extension,
+the "ordering/selectivity, not raw depth" read above was a hypothesis, not
+something proven — traced properly (via `analysis.trace`, replay-faithful
+for 68/72/74; a cold fresh-state trace for 46/62, whose original PGNs predate
+this tooling) before accepting it:
+
+| Position | Correct move found? | Depth reached | Root behavior | Timed out? | Trace's own final answer |
+|---|---|---|---|---|---|
+| R46 (cold) | Yes, from d1 | d9 | Bc5 leads d1-6, Qb6 overtakes d7 and holds | No | Qb6 ✓ matches "best" |
+| R62 (cold) | Yes, from d1 | **d8 never completes** | f5 leads/ties d1-7 | **Yes — f5 alone burned 482,760 nodes at d8** | f5 (d7, stale) |
+| R68 m39 (replay, 4 mismatches) | Yes — Ke4 is TT/first at every depth | d7 | Ke4 always first | No | Ke4 ✓ matches "best" |
+| R68 m43 (replay, 4 mismatches) | Yes | d12 | **Lead flips: Kb4 d1-9 → Kb2 d10 → Kb4 d11 → tie d12** | No | Kb4 ✓ (barely) |
+| R72 m17 (replay, 1 mismatch) | Yes — Bxe4 is TT/first from d2 | d8 | Bxe4 always first from d2 | No | Bxe4 ✓ matches "best" |
+| R74 m36 (replay, 13 mismatches) | Yes | d9 | Kg1 leads d2-9, margin shrinks 130cp→4cp | No | Kg1 (razor-thin, still closing) |
+
+**No single mechanism explains all four — four different ones do:**
+- **R62 is a clean, concrete time-allocation failure.** `f5`'s own subtree is
+  so expensive (the forced-mate line, extended by check/forced-reply
+  extensions) that it alone exhausts the depth-8 budget, so the whole
+  iteration fails and `search_root` falls back to depth 7's stale, wrong
+  answer. This is the one case with an identified, reproducible root cause —
+  see the still-open question at the end of this section.
+- **R46 and R74 look like convergence/state sensitivity, not a structural
+  miss.** The correct move does emerge, but exactly when it overtakes (R46:
+  cold-state d7; R74: still narrowing at d9, not yet flipped) is sensitive to
+  search state and depth reached.
+- **R68 m39, R68 m43, and R72 m17 are the most surprising result: replayed
+  under real accumulated state and the real clock, the search gets all three
+  *right*.** That directly weakens "ordering/selectivity is broken" as a
+  general claim — if it were structurally broken, replay should reproduce
+  the mistake, not fix it. The more honest reading is real-game-specific:
+  either genuine machine/timing variance between the actual tournament run
+  and any replay, or the small state divergence (1-4 replay mismatches) was
+  enough to tip an already-close decision.
+
+**Still open, and the most concrete next step identified:** *why is `f5`'s
+line in R62 that expensive — which extensions are actually firing, and how
+deep does the forced sequence really run? That's worth understanding before
+deciding whether it's worth a targeted fix, since it's the one case in this
+table with an identified, reproducible mechanism rather than a hypothesis.*
+
 ### Measured profile
 
 Nodes per second was 9-11k before this session's jits; roughly 15-25k after,
@@ -529,12 +570,14 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
 (`--base-ms 120000 --increment-ms 500`) before it ships.
 
 1. ~~Recapture and threat extensions~~ — tried, lost the arena (40.0%,
-   see "Tried and rejected" above), reverted. Four confirmed instances of
-   round 46/62/68/74's failure mode (static eval near-tied, real gap several
-   plies deeper) turning out not to be fixed by the most directly-targeted
-   extension for that pattern suggests the actual problem is more likely
-   ordering/selectivity than raw depth. A genuinely different angle on this
-   failure family — not another extension — is the open question now.
+   see "Tried and rejected" above), reverted. Traced properly afterward (see
+   "The four-loss evidence table" above) rather than left as a hypothesis:
+   the four losses do NOT share one mechanism. **The concrete next step is
+   R62 specifically** — its `f5` line is the one case with an identified,
+   reproducible cause (a single candidate's subtree so expensive it alone
+   exhausts the depth-8 time budget). Understand which extensions are firing
+   and how deep that forced sequence actually runs before deciding whether a
+   targeted fix is worth it. This is where the next session should start.
 2. **Measure whether the forced-reply extension is a net positive** across
    ordinary games, not just the two adversarial cases that motivated it. It's
    verified sound and triggers correctly; strength effect is genuinely unknown.

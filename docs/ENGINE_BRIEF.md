@@ -132,7 +132,25 @@ done.
 | v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast-clock arena was noise (51.2%/40 games, expected at that clock); kept on the strength of a bit-exact correctness proof instead |
 | v1.9 over v1.8 — forced-reply extension, numba mobility/king-zone jit, incremental Zobrist | not arena-confirmed at all, individually or combined, given a tournament deadline; each verified to the strongest correctness standard available for its kind (see §4) |
 | v20 over v1.9 (merged to main) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed; each phase verified to a correctness standard instead (see §4). Built at explicit user request, overriding an earlier "not worth the risk" rejection of this architecture. |
+| Recapture extension over v20 (+1 ply on the opponent's last-move square) | **lost the arena, 40.0% (+8 =8 −14, 30 games)** — reverted; see §4 |
 | Aspiration windows | −15.6% nodes to depth 8; **lost the arena, 42.5%, with one game lost by flagging** — rejected, still disabled |
+
+`analysis/trace.py` (new this session) replays a real PGN via real `get_move()`
+calls, so a traced position runs under the same accumulated TT/killers/history
+and the same real clock the tournament game had, then reports every root
+candidate's score/nodes/completion at every depth — built specifically to
+answer why the recapture extension's target failure mode (rounds 46/62/68/74:
+static eval nearly tied, real gap only several plies deeper) kept recurring.
+Traced properly rather than left as a hypothesis, those four losses turned out
+to share no single mechanism: round 62 is a clean, reproducible time-budget
+failure (one candidate's subtree, `f5`, alone exhausts an entire depth
+iteration's time before it can complete); rounds 46 and 74 look like
+convergence/state sensitivity, not a structural miss; and rounds 68/72,
+replayed under real accumulated state, actually find the *correct* move —
+directly weakening "ordering is broken" as a general explanation. See
+CLAUDE.md's "How changes get decided" for the full evidence table; round 62's
+`f5` line (why is it that expensive, which extensions are firing, how deep
+does the forced sequence really run) is the concrete open question.
 
 ---
 
