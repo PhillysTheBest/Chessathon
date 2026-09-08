@@ -187,7 +187,7 @@ of phantom loss on moves that were in fact best. If a move where played equals
 best does not report exactly 0 loss, the methodology is broken.
 
 `analysis/positions.epd` is the scenario suite: a FEN plus a move that must be
-found (`bm`) or must not be played (`am`), grouped by theme. Currently 12/15.
+found (`bm`) or must not be played (`am`), grouped by theme. Currently 14/17.
 Add a line whenever a rated game exposes a weakness. `kingsafety` and `endgame`
 are the thinnest themes. The suite's wall-clock timing has real run-to-run
 noise near a depth-completion boundary — before concluding a code change
@@ -389,6 +389,38 @@ more tuning rather than after another loss:
   line (after `Nxf5+` the king has exactly one legal reply, seldepth 14->21)
   but is not enough alone to flip the result — the actual refutation needs more
   than one extra ply there. Regression case in the suite.
+- **Round 68** was lost by checkmate from a roughly balanced position out of a
+  sound piece sac (Bxg6/Qxg6 around move 19, confirmed only 18cp off the
+  alternative). Not a round-46/round-62 style single horizon miss: a long run
+  of 20-90cp second-best rook-endgame moves, same profile as round 49, then
+  two real king-activity errors in the resulting K+R(+pawns) ending (move 39
+  `Kd2`, -188cp against `Ke4`; move 43 `Kb2`, -176cp against `Kb4`). Both
+  regression cases in the suite. Reinforces "endgame" as the thinnest theme,
+  the same king-activity judgment as the still-unverified "take the
+  opposition" entry — not a coincidence, and not a one-off.
+
+`analysis/blunders.py` was rebuilt this session around round 68: the old
+version scored *every* legal move at *every* our-move with an independent
+equal-depth child search, so a full game took hours, not minutes. It now
+runs in two stages — a cheap fixed-depth pass over every legal move sharing
+one TT/killers/history state (mirroring `_root_window`'s own algorithm
+without touching that function), flagging a position as suspicious only on a
+disagreement with the played move or a large eval swing; then, for
+suspicious positions only, the original proven-sound equal-depth comparison
+on a handful of candidates instead of all of them, with state now reset
+*per candidate* rather than once per position (closing a fairness gap the
+old version had). A full round-68 replay dropped from "still running after
+20+ minutes, no visible progress" to under 2 minutes for the informative
+part of the game. One real limitation stated plainly in its own docstring: a
+shallow first pass cannot see a problem that only resolves below its depth,
+so a genuine round-46/round-62-style horizon blunder can pass through
+undetected — `--force-deep` exists for when one is suspected on other
+grounds. It also surfaced a live bug while being built: `TimeUp` from a deep
+forced-reply/check-extension chain (a promotion-with-check sequence near
+mate took over 170s at nominal depth 7) was uncaught and, worse, would have
+left the board several plies deep afterward with no error at all — fixed by
+unwinding to the pre-candidate stack depth in a `finally`, the same
+invariant `_root_window` already protects in `agent.py` itself.
 
 ### Measured profile
 

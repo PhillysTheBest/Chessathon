@@ -42,3 +42,15 @@ r3kb1r/pp1b1ppp/4p3/3pP3/P2N1P2/3Q4/1qPBK1PP/R6R b kq - 3 15 ; id "r46: Bc5 lose
 # Same failure family as r46 (missed at depth <9); candidate fix is the
 # still-open recapture/threat extensions item, not a quick patch here.
 7R/5pk1/1p5R/4p3/r2rBn2/5KN1/PP3P2/8 b - - 11 37 ; id "r62: f5 walks into mate, play Rd3+" ; theme regression ; am f5
+# Round 68, lost by checkmate. No single depth-9-style horizon miss like r46/
+# r62 - a long run of 20-90cp second-best rook-endgame moves (same profile as
+# r49) that never individually crossed the blunder threshold, THEN two real
+# king-activity errors in the resulting K+R(+pawns) ending. Both confirmed via
+# the redesigned analysis.blunders (equal-depth verification, not a single
+# exhaustive scan - see that file's own docstring): move 39, Kd2 scores -334
+# against Ke4's -146, a 188cp loss; move 43, Kb2 scores -395 against Kb4's
+# -219, a 176cp loss. Reinforces the already-open "endgame is the thinnest
+# theme" item and the unverified "take the opposition" entry above - this is
+# the same king-activity judgment, not a coincidence.
+8/pR3b1k/3R3p/4P3/2p5/2r1K2P/6P1/5r2 w - - 0 39 ; id "r68 m39: Kd2 loses the king race, play Ke4" ; theme regression ; am Kd2
+8/R4b1k/3RP2p/8/2p5/2K4P/6P1/2rr4 w - - 3 43 ; id "r68 m43: Kb2 mis-steps, play Kb4" ; theme regression ; am Kb2
