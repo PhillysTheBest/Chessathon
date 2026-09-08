@@ -290,6 +290,26 @@ the threshold before abandoning the mechanism.**
 
 ### Tried and rejected
 
+**Recapture extension.** +1 ply for a move recapturing on the square the
+opponent's last move landed on — aimed squarely at the round 46/62/68/74
+failure family. Lost the arena: 40.0% (+8 =8 −14, 30 games) against
+`baselines/philbert-v20`, outside the no-information band. Reverted rather
+than kept-disabled, since (unlike aspiration windows below) there's no known
+implementation defect to fix first — the idea itself just didn't help. A
+"threat" (check-giving) extension was tried alongside it and reverted before
+ever reaching an arena: a move that gives check makes its own child node's
+`is_check()` true, and that child already extends itself via the existing
+check extension a few lines below — a second +1 at the parent for the same
+event double-counts every check in a game, and blew a scenario-suite
+position out to depth 0 in 3 seconds on the first real test. Four confirmed
+instances of "static eval nearly tied, real gap only visible several plies
+deeper" (46, 62, 68, 74) turning out not to be fixed by the cheapest,
+most-targeted extension for exactly that pattern is itself informative: the
+problem in those games may be less "the search doesn't go deep enough on
+the right branch" than "the search goes deep enough somewhere else instead"
+— an ordering/selectivity question, not a raw-depth one. Worth keeping in
+mind before the next attempt at this failure family.
+
 **Aspiration windows.** Real node saving, 289804 -> 244629 to reach depth 8, and
 still lost the arena: 42.5% against v1.4, with **one game lost by flagging**.
 The code is still present but disabled via `ASPIRATION_MIN_DEPTH = 999`. The
@@ -508,15 +528,13 @@ or debug-assert-verified correctness proof can substitute). Screen at the
 arena's default fast clock; **re-confirm any winner at realistic clock**
 (`--base-ms 120000 --increment-ms 500`) before it ships.
 
-1. **Recapture and threat extensions.** Cheap, and aimed at the round 46/62
-   failure mode more directly than the forced-reply extension already shipped
-   (which helps only when a node narrows to exactly one legal reply). Round 68
-   moves 39/43 and round 74 move 36 (see above) are now a fourth confirmed
-   instance of this exact failure mode, not just two — every one of them a
-   forced sequence the search only resolves several plies past where a
-   static-eval comparison would call the position a near-tie. This is now
-   the single most repeated finding in the postmortem history and should
-   move up from "priority 1 on a list" to "actually build it next."
+1. ~~Recapture and threat extensions~~ — tried, lost the arena (40.0%,
+   see "Tried and rejected" above), reverted. Four confirmed instances of
+   round 46/62/68/74's failure mode (static eval near-tied, real gap several
+   plies deeper) turning out not to be fixed by the most directly-targeted
+   extension for that pattern suggests the actual problem is more likely
+   ordering/selectivity than raw depth. A genuinely different angle on this
+   failure family — not another extension — is the open question now.
 2. **Measure whether the forced-reply extension is a net positive** across
    ordinary games, not just the two adversarial cases that motivated it. It's
    verified sound and triggers correctly; strength effect is genuinely unknown.
