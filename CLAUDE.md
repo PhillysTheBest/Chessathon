@@ -157,6 +157,7 @@ rewritten, so an arena result attributes cleanly to one constant.
 | v1.3 — repetition counting, low-clock budget cap | safety fixes, not separately measured |
 | v1.4 over v1.3 — lazy eval + SEE at threshold −110 | **70.0%** |
 | v1.6 over v1.5 — TT/check-extension depth fix, qsearch draw detection | safety fixes, sanity-checked only (12 games, 50.0%) |
+| v1.7 over v1.6 — staged TT-move-first search | inconclusive: 43.8% over 40 games, within noise; kept, not reverted |
 
 `submission.zip` should be built from a version that has beaten the one on the
 ladder. As of the last session that is **v1.4**.
@@ -309,7 +310,7 @@ Ordered by expected value. Anything here that claims a gain has to survive a
 
 ### Next
 
-All arenas below run against `baselines/philbert-v16`, not `v14` — see the
+All arenas below run against `baselines/philbert-v17`, not `v14` — see the
 self-audit note above. Screen at the arena's default fast clock; **re-confirm
 any winner at `--base-ms 120000 --increment-ms 500`** before it ships, since
 the fast clock and the realistic clock are now known to reach different
@@ -331,16 +332,19 @@ depths.
       doesn't matter.
 - [ ] **New: unconfound LMP from futility** (self-audit finding above). Build a
       diagnostic-only variant with `FUTILITY_MARGIN` set unreachably high, then
-      sweep `LMP_COUNT` tight/loose against *that*, not `v16`. If a real
+      sweep `LMP_COUNT` tight/loose against *that*, not `v17`. If a real
       gradient appears where none did before, `LMP_COUNT` has genuine signal
       that was masked; if still null, the existing conclusion stands on firmer
       ground. Never ship the futility-disabled variant itself.
-- [ ] **New: staged TT-move-first search.** `negamax` always builds the full
-      legal-move list even when the TT move alone (searched first) would cut
-      off. `Board.is_legal()` doesn't generate the full list, so trying the TT
-      move via `is_legal` first and only generating the rest on a miss is a
-      behavior-preserving speed win — no arena needed to justify it, just the
-      usual gate plus an NPS comparison.
+
+**Done, inconclusive:** staged TT-move-first search shipped as v1.7. Turned
+out not to be the free win it looked like — skipping move generation after an
+early TT-move cutoff changes which sub-nodes get cached, and that can shift a
+cold-TT score by tens of centipawns through LMR/NMP/futility's approximate
+behavior, so it needed the same arena treatment as everything else. 43.8% over
+40 games against v16, within noise; kept rather than reverted since there
+were no correctness defects.
+
 - [ ] **numba on `evaluate`, first half only**: material, PST and pawn
       structure, which need no attack generation. Measure before attempting
       mobility and king safety, which need sliding attacks reimplemented inside
