@@ -979,14 +979,6 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
         if entry is not None and entry[0] == key:
             tt_move = entry[4]
 
-    moves = list(board.legal_moves)
-    if not moves:
-        # Checkmate, or stalemate. Stalemate was a LOSS in the 5x5 variant;
-        # in standard chess it is a draw and must score 0.
-        return -MATE_SCORE + ply if in_check else 0
-
-    moves = order_moves(board, moves, tt_move, ply, prev_move)
-
     them = board.occupied_co[not board.turn]
     can_futility = (
         not is_pv
@@ -998,79 +990,130 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
     can_lmp = not is_pv and not in_check and depth <= 6 and abs(alpha) < MATE_BOUND
 
     best_score = -INFINITY
-    best_move = moves[0]
+    best_move = None
     searched = 0
+
+    # Staged move generation. A TT move is always searched first when present
+    # (order_moves gives it absolute priority below), and python-chess's own
+    # legal-move generation is comparatively expensive. Board.is_legal() does
+    # not build that list, so if the TT move alone is legal and already
+    # produces a cutoff, every other move was going to be skipped anyway —
+    # try it before paying for the full list.
+    tt_move_legal = tt_move is not None and board.is_legal(tt_move)
+    cutoff = False
 
     SEARCH.path.append(key)
     try:
-        for move_index, move in enumerate(moves):
+        if tt_move_legal and tt_move is not None:
+            move = tt_move
             is_capture = bool(chess.BB_SQUARES[move.to_square] & them)
             is_quiet = not is_capture and not move.promotion
 
-            if is_quiet and searched > 0:
-                # Late move pruning: in a node that already looks bad, stop
-                # looking at quiet moves once enough have failed.
-                if can_lmp and move_index >= LMP_COUNT[depth]:
-                    continue
-                # Futility: a quiet move cannot lift a static score that is
-                # already a full margin below alpha.
-                if can_futility:
-                    continue
-
             board.push(move)
-            gives_check = board.is_check()
-
-            if searched == 0:
-                score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move)
-            else:
-                reduction = 0
-                if is_quiet and depth >= 3 and not gives_check and move_index >= 3:
-                    reduction = LMR[min(depth, 63)][min(move_index, 63)]
-                    if is_pv:
-                        reduction -= 1
-                    if reduction < 0:
-                        reduction = 0
-                    if reduction > depth - 2:
-                        reduction = depth - 2
-
-                score = -negamax(board, depth - 1 - reduction, -alpha - 1,
-                                 -alpha, ply + 1, move)
-
-                # The reduced search beat alpha, so redo it at full depth.
-                if reduction > 0 and score > alpha:
-                    score = -negamax(board, depth - 1, -alpha - 1, -alpha,
-                                     ply + 1, move)
-
-                # PVS re-search on a full window inside the bounds.
-                if alpha < score < beta:
-                    score = -negamax(board, depth - 1, -beta, -alpha,
-                                     ply + 1, move)
-
+            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move)
             piece_type = board.piece_type_at(move.to_square)
             board.pop()
-            searched += 1
+            searched = 1
 
-            if score > best_score:
-                best_score = score
-                best_move = move
-                if score > alpha:
-                    alpha = score
-                    if alpha >= beta:
-                        if is_quiet:
-                            # Killer, counter move and history updates, lifted
-                            # from the 5x5 engine's ordering scheme.
-                            if ply < MAX_PLY:
-                                slot = KILLERS[ply]
-                                if slot[0] != move:
-                                    slot[1] = slot[0]
-                                    slot[0] = move
-                            if prev_move is not None:
-                                COUNTER[prev_move.from_square][
-                                    prev_move.to_square] = move
-                            if piece_type:
-                                HISTORY[piece_type][move.from_square][
-                                    move.to_square] += depth * depth
-                        break
+            best_score = score
+            best_move = move
+            if score > alpha:
+                alpha = score
+                if alpha >= beta:
+                    cutoff = True
+                    if is_quiet:
+                        if ply < MAX_PLY:
+                            slot = KILLERS[ply]
+                            if slot[0] != move:
+                                slot[1] = slot[0]
+                                slot[0] = move
+                        if prev_move is not None:
+                            COUNTER[prev_move.from_square][
+                                prev_move.to_square] = move
+                        if piece_type:
+                            HISTORY[piece_type][move.from_square][
+                                move.to_square] += depth * depth
+
+        if not cutoff:
+            moves = list(board.legal_moves)
+            if not moves:
+                # Checkmate, or stalemate. Stalemate was a LOSS in the 5x5
+                # variant; in standard chess it is a draw and must score 0.
+                return -MATE_SCORE + ply if in_check else 0
+
+            moves = order_moves(board, moves, tt_move, ply, prev_move)
+
+            for move_index, move in enumerate(moves):
+                if tt_move_legal and move == tt_move:
+                    continue  # already searched above
+
+                is_capture = bool(chess.BB_SQUARES[move.to_square] & them)
+                is_quiet = not is_capture and not move.promotion
+
+                if is_quiet and searched > 0:
+                    # Late move pruning: in a node that already looks bad, stop
+                    # looking at quiet moves once enough have failed.
+                    if can_lmp and move_index >= LMP_COUNT[depth]:
+                        continue
+                    # Futility: a quiet move cannot lift a static score that is
+                    # already a full margin below alpha.
+                    if can_futility:
+                        continue
+
+                board.push(move)
+                gives_check = board.is_check()
+
+                if searched == 0:
+                    score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move)
+                else:
+                    reduction = 0
+                    if is_quiet and depth >= 3 and not gives_check and move_index >= 3:
+                        reduction = LMR[min(depth, 63)][min(move_index, 63)]
+                        if is_pv:
+                            reduction -= 1
+                        if reduction < 0:
+                            reduction = 0
+                        if reduction > depth - 2:
+                            reduction = depth - 2
+
+                    score = -negamax(board, depth - 1 - reduction, -alpha - 1,
+                                     -alpha, ply + 1, move)
+
+                    # The reduced search beat alpha, so redo it at full depth.
+                    if reduction > 0 and score > alpha:
+                        score = -negamax(board, depth - 1, -alpha - 1, -alpha,
+                                         ply + 1, move)
+
+                    # PVS re-search on a full window inside the bounds.
+                    if alpha < score < beta:
+                        score = -negamax(board, depth - 1, -beta, -alpha,
+                                         ply + 1, move)
+
+                piece_type = board.piece_type_at(move.to_square)
+                board.pop()
+                searched += 1
+
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+                    if score > alpha:
+                        alpha = score
+                        if alpha >= beta:
+                            if is_quiet:
+                                # Killer, counter move and history updates,
+                                # lifted from the 5x5 engine's ordering scheme.
+                                if ply < MAX_PLY:
+                                    slot = KILLERS[ply]
+                                    if slot[0] != move:
+                                        slot[1] = slot[0]
+                                        slot[0] = move
+                                if prev_move is not None:
+                                    COUNTER[prev_move.from_square][
+                                        prev_move.to_square] = move
+                                if piece_type:
+                                    HISTORY[piece_type][move.from_square][
+                                        move.to_square] += depth * depth
+                            break
     finally:
         SEARCH.path.pop()
 
@@ -1078,6 +1121,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
         # Everything was pruned. Return a static score rather than handing
         # -INFINITY back to the parent.
         return static_eval
+    assert best_move is not None  # some move set it, or best_score is -INFINITY
 
     # --- transposition store ----------------------------------------------
     if best_score <= original_alpha:
