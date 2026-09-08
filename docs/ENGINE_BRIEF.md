@@ -142,15 +142,26 @@ candidate's score/nodes/completion at every depth — built specifically to
 answer why the recapture extension's target failure mode (rounds 46/62/68/74:
 static eval nearly tied, real gap only several plies deeper) kept recurring.
 Traced properly rather than left as a hypothesis, those four losses turned out
-to share no single mechanism: round 62 is a clean, reproducible time-budget
-failure (one candidate's subtree, `f5`, alone exhausts an entire depth
-iteration's time before it can complete); rounds 46 and 74 look like
-convergence/state sensitivity, not a structural miss; and rounds 68/72,
-replayed under real accumulated state, actually find the *correct* move —
-directly weakening "ordering is broken" as a general explanation. See
-CLAUDE.md's "How changes get decided" for the full evidence table; round 62's
-`f5` line (why is it that expensive, which extensions are firing, how deep
-does the forced sequence really run) is the concrete open question.
+to share no single mechanism: rounds 46, 62 and 74 look like convergence/depth
+sensitivity, not a structural miss; rounds 68/72, replayed under real
+accumulated state, actually find the *correct* move — directly weakening
+"ordering is broken" as a general explanation. Round 62's `f5` line was dug
+into further in a later session: the old read (`f5`'s subtree alone exhausts
+a depth iteration's time budget, so `search_root` falls back to a stale
+answer) turned out to be an artifact of tracing from a cold state on the old,
+slower engine. Replaying the real game's accumulated state and real clock on
+the current engine shows no timeout at all — depth 9 completes in well under
+a second and returns `f5` (matching what was played) because `f5` and `Rd3+`
+score within 6cp of each other there. The expensive blowup is real (a
+cold-state trace with a large time budget reproduces it and finds `f5`'s true
+score is a forced mate) but warm ordering only delays it, past any realistic
+per-move budget; a ply-by-ply walk of the actual mating line shows check and
+forced-reply extensions earning it +7 plies over a nominal 10-ply length,
+needing effective depth ~17 to resolve. Both extensions fire correctly — this
+is a genuine horizon/time-budget shortfall under real clock pressure, not a
+bug, and is now a data point for trying singular extensions (§5 open
+questions) rather than its own open item. See CLAUDE.md's "How changes get
+decided" for the full evidence table.
 
 ---
 
@@ -318,8 +329,11 @@ list reflects what's actually still open.
    adversarial cases that motivated it — is still an open question.
 5. Singular extensions remain unimplemented. At depth 6–8, is the node cost
    worth it, or do they only pay from depth 10 upward? Recapture/threat
-   extensions, a smaller and cheaper idea in the same family, are also
-   unimplemented and directly targeted at the round 46/round 62 failure mode.
+   extensions, a smaller and cheaper idea in the same family, were tried and
+   reverted (lost the arena, 40.0% — see §4); round 62's traced `f5` line
+   (see §3) is a quantified data point for singular extensions specifically,
+   since it needs effective depth ~17 to resolve, well past what recapture/
+   threat extensions' single extra ply could reach.
 6. What is the highest-value technique we have not listed at all?
 
 **On machine learning**

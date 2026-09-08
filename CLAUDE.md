@@ -510,23 +510,49 @@ this tooling) before accepting it:
 | Position | Correct move found? | Depth reached | Root behavior | Timed out? | Trace's own final answer |
 |---|---|---|---|---|---|
 | R46 (cold) | Yes, from d1 | d9 | Bc5 leads d1-6, Qb6 overtakes d7 and holds | No | Qb6 ✓ matches "best" |
-| R62 (cold) | Yes, from d1 | **d8 never completes** | f5 leads/ties d1-7 | **Yes — f5 alone burned 482,760 nodes at d8** | f5 (d7, stale) |
+| R62 (replay-faithful, 6 mismatches) | Tied — f5/Rd3+ within 6cp, neither shows the mate | d9 (real ~4.9s budget) | f5 marginally ahead the whole way, ties Rd3+ by d9 | No | f5 (matches played; genuinely indistinguishable from Rd3+ at this depth) |
 | R68 m39 (replay, 4 mismatches) | Yes — Ke4 is TT/first at every depth | d7 | Ke4 always first | No | Ke4 ✓ matches "best" |
 | R68 m43 (replay, 4 mismatches) | Yes | d12 | **Lead flips: Kb4 d1-9 → Kb2 d10 → Kb4 d11 → tie d12** | No | Kb4 ✓ (barely) |
 | R72 m17 (replay, 1 mismatch) | Yes — Bxe4 is TT/first from d2 | d8 | Bxe4 always first from d2 | No | Bxe4 ✓ matches "best" |
 | R74 m36 (replay, 13 mismatches) | Yes | d9 | Kg1 leads d2-9, margin shrinks 130cp→4cp | No | Kg1 (razor-thin, still closing) |
 
-**No single mechanism explains all four — four different ones do:**
-- **R62 is a clean, concrete time-allocation failure.** `f5`'s own subtree is
-  so expensive (the forced-mate line, extended by check/forced-reply
-  extensions) that it alone exhausts the depth-8 budget, so the whole
-  iteration fails and `search_root` falls back to depth 7's stale, wrong
-  answer. This is the one case with an identified, reproducible root cause —
-  see the still-open question at the end of this section.
-- **R46 and R74 look like convergence/state sensitivity, not a structural
-  miss.** The correct move does emerge, but exactly when it overtakes (R46:
-  cold-state d7; R74: still narrowing at d9, not yet flipped) is sensitive to
-  search state and depth reached.
+**No single mechanism explains all four — three different ones do:**
+- **R62's old diagnosis (a depth-8 timeout falling back to a stale depth-7
+  answer) does not hold on the current engine, and was re-investigated this
+  session to find out why.** That story came from a *cold-state* trace on the
+  old (9-11k nps) v1.8 agent.py. Replaying the real game on today's engine
+  (real accumulated TT/killers/history, real clock) shows no timeout at all —
+  `search_root` reaches depth 9 in well under a second combined for both
+  candidates and returns `f5`, matching what was actually played, because at
+  that depth `f5` and `Rd3+` score within 6cp of each other (-1023 vs -1029).
+  The expensive blowup itself is still real and reproduces on current code —
+  a cold-state trace with a 120s budget finds it again (`f5`'s subtree costs
+  835,596 nodes/39.6s at depth 8 alone, at which point it *does* resolve
+  `f5`'s true score: a forced mate at -29990, against `Rd3+`'s -1380) — but
+  warm move ordering doesn't eliminate that cost, only delays it: replaying
+  the real state with a 180s budget instead of the real clock pushes the same
+  explosion out to depth 11-12 (2.7M+ nodes, still times out at 180s), and
+  even by depth 11 `f5` and `Rd3+` remain exactly tied at -1601, the mate
+  still not isolated for either. So under real tournament conditions this was
+  never a stale-fallback bug — depth 9's answer is genuine, non-timed-out,
+  just not deep enough. A direct ply-by-ply walk of the real mating sequence
+  (`f5 Nxf5+ Kf7 R8h7+ Kf8 Rf6+ Ke8 Re7+ Kd8 Rf8#`) shows why: 5 of White's
+  checks each trigger the check extension, and 2 of those also leave Black
+  exactly one legal reply, triggering the forced-reply extension too —
+  earning +7 plies of extension over the nominal 10-ply line, so resolving it
+  needs effective depth ~17, far past what a several-second per-move budget
+  affords this late in a sub-30-second-clock endgame. Both extensions fire
+  exactly as designed; there is no implementation defect here to fix. R62
+  moves from "the one case with an identified, reproducible time-allocation
+  bug" into the same family as R46/R74 below: a genuine horizon/depth
+  shortfall, not a structural search bug.
+- **R46, R62 and R74 all look like convergence/depth sensitivity, not a
+  structural miss.** The correct move (or, for R62, a tied and genuinely
+  indistinguishable score) does emerge, but exactly when/whether it resolves
+  is sensitive to search state and depth reached: R46 overtakes at cold-state
+  d7; R62 needs effective depth ~17 along its critical line (quantified
+  above) and never gets there within a realistic per-move budget; R74 is
+  still narrowing at d9, not yet flipped.
 - **R68 m39, R68 m43, and R72 m17 are the most surprising result: replayed
   under real accumulated state and the real clock, the search gets all three
   *right*.** That directly weakens "ordering/selectivity is broken" as a
@@ -536,11 +562,17 @@ this tooling) before accepting it:
   and any replay, or the small state divergence (1-4 replay mismatches) was
   enough to tip an already-close decision.
 
-**Still open, and the most concrete next step identified:** *why is `f5`'s
-line in R62 that expensive — which extensions are actually firing, and how
-deep does the forced sequence really run? That's worth understanding before
-deciding whether it's worth a targeted fix, since it's the one case in this
-table with an identified, reproducible mechanism rather than a hypothesis.*
+**Resolved this session:** why `f5`'s line in R62 is expensive, which
+extensions fire, and how deep the forced sequence runs — see the R62 bullet
+above (check + forced-reply extensions, +7 plies over a nominal 10-ply mating
+line, effective depth ~17 needed). Nothing further to do on R62 itself: no
+implementation defect was found, and the extensions involved are already
+working as intended. What this investigation leaves as **the next concrete
+question** is whether a mechanism that can recognize a line needs deep
+resolution *without* paying iterative deepening's cost of bringing every
+sibling branch to the same nominal depth first — i.e. singular extensions
+(Open Work item 4) — would actually help here. R62 is now a clean, quantified
+data point in favor of trying that, not a bug to patch directly.
 
 ### Measured profile
 
@@ -577,12 +609,18 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
 1. ~~Recapture and threat extensions~~ — tried, lost the arena (40.0%,
    see "Tried and rejected" above), reverted. Traced properly afterward (see
    "The four-loss evidence table" above) rather than left as a hypothesis:
-   the four losses do NOT share one mechanism. **The concrete next step is
-   R62 specifically** — its `f5` line is the one case with an identified,
-   reproducible cause (a single candidate's subtree so expensive it alone
-   exhausts the depth-8 time budget). Understand which extensions are firing
-   and how deep that forced sequence actually runs before deciding whether a
-   targeted fix is worth it. This is where the next session should start.
+   the four losses do NOT share one mechanism. ~~The concrete next step is
+   R62 specifically~~ — **done this session**: R62's `f5` line does earn +7
+   plies of extension over its nominal 10-ply mating length (5 checks +
+   2 forced-single-reply nodes), needing effective depth ~17 to fully
+   resolve, but on the current engine this is a genuine horizon shortfall
+   under real time pressure, not a timeout/stale-fallback bug — replaying
+   the real game's accumulated state and clock shows `search_root` never
+   times out here, it just isn't deep enough. No implementation defect
+   found; both extensions already fire correctly. See "The four-loss
+   evidence table" above for the full trace. This closes out R62 as its own
+   item — it's now evidence *for* item 4 below (singular extensions) rather
+   than a separate open question.
 2. **Measure whether the forced-reply extension is a net positive** across
    ordinary games, not just the two adversarial cases that motivated it. It's
    verified sound and triggers correctly; strength effect is genuinely unknown.
