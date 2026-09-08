@@ -1,4 +1,6 @@
 import argparse
+import re
+import subprocess
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -7,6 +9,8 @@ from harness.rules import MAX_UNZIPPED_BYTES
 
 DEFAULT_INCLUDES = ("weights",)
 SKIP = {"__pycache__", ".DS_Store"}
+
+BUILD_ID_PATTERN = r'^BUILD_ID = .*'
 
 
 def members(root: Path, includes: tuple[str, ...]) -> Iterator[tuple[Path, str]]:
@@ -27,14 +31,45 @@ def members(root: Path, includes: tuple[str, ...]) -> Iterator[tuple[Path, str]]
                     yield path, str(path.relative_to(root))
 
 
+def current_build_id(root: Path) -> str:
+    """Short commit hash, +dirty appended if the working tree has uncommitted
+    changes - stamped into agent.py's BUILD_ID so a rated game's log always
+    says exactly which commit produced it (see BUILD_ID's own comment)."""
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=root,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root,
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return commit + ("+dirty" if status.strip() else "")
+
+
 def build(root: Path, destination: Path, includes: tuple[str, ...]) -> list[str]:
     entries = list(members(root, includes))
     written = [name for _, name in entries]
     if "agent.py" not in written:
         raise SystemExit(f"{root / 'agent.py'} does not exist; the platform imports it by name")
+
+    build_id = current_build_id(root)
     with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
         for source, name in entries:
-            archive.write(source, name)
+            if name == "agent.py":
+                source_text = source.read_text(encoding="utf-8")
+                stamped, count = re.subn(
+                    BUILD_ID_PATTERN, f'BUILD_ID = "{build_id}"', source_text,
+                    count=1, flags=re.M)
+                if count != 1:
+                    raise SystemExit(
+                        "agent.py: BUILD_ID pattern matched "
+                        f"{count} lines, expected 1 - packaging cannot stamp the build id")
+                archive.writestr(name, stamped)
+            else:
+                archive.write(source, name)
     return written
 
 

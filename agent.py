@@ -43,6 +43,13 @@ from numba import njit
 
 DEBUG = True  # writes to stderr; the platform keeps it in the per-game log
 
+# Stamped with the current git commit by harness.package's build step (see
+# that file) so a rated game's log always says exactly which commit played
+# it - resolved a real ambiguity this session about which build produced a
+# given match log. "dev" means this copy was never rebuilt through that path
+# (e.g. run directly from the working tree during development).
+BUILD_ID = "dev"
+
 MAX_DEPTH_CAP = 64
 MAX_PLY = 128
 
@@ -2348,6 +2355,10 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
 
 def _warm_up():
+    if DEBUG:
+        # Always the first line of a game's log, on purpose - see BUILD_ID's
+        # own comment.
+        print(f"build {BUILD_ID}", file=sys.stderr)
     board = chess.Board()
     SEARCH.hard_deadline = time.perf_counter() + 3.0
     SEARCH.soft_deadline = SEARCH.hard_deadline
