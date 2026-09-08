@@ -34,6 +34,8 @@ import time
 
 import chess
 import chess.polyglot
+import numpy as np
+from numba import njit
 
 # =============================================================================
 # TUNABLES
@@ -444,6 +446,69 @@ SEARCH = Searcher()
 # EVALUATION
 # =============================================================================
 
+# numpy mirrors of the PST/material tables above, for the jitted pass 1 below.
+# Kept alongside the plain-Python tables rather than replacing them: pass 2
+# and move ordering still read the originals, and duplicating a few small
+# arrays is cheaper than threading numpy types through the whole file.
+PST_MG_NP = np.array(PST_MG, dtype=np.int64)
+PST_EG_NP = np.array(PST_EG, dtype=np.int64)
+PIECE_VALUE_MG_NP = np.array(PIECE_VALUE_MG, dtype=np.int64)
+PIECE_VALUE_EG_NP = np.array(PIECE_VALUE_EG, dtype=np.int64)
+PHASE_WEIGHT_NP = np.array(PHASE_WEIGHT, dtype=np.int64)
+
+
+@njit(cache=False)
+def _jit_material_pst(bitboards, pst_mg, pst_eg, piece_value_mg, piece_value_eg,
+                       phase_weight, bishop_pair_mg, bishop_pair_eg):
+    """Material, PST and bishop pair, jitted. Mirrors evaluate()'s pass 1
+    exactly; see the parity check referenced in the commit that added this
+    before trusting it further than that.
+
+    bitboards is a (2, 7) uint64 array, bitboards[color][piece_type], indices
+    matching python-chess's own color (False/True) and piece-type (1..6)
+    values so callers can build it directly from Board attributes.
+    """
+    mg = 0
+    eg = 0
+    phase = 0
+    for color in range(2):
+        sign = 1 if color == 1 else -1
+        table_mg = pst_mg[color]
+        table_eg = pst_eg[color]
+        for piece_type in range(1, 7):
+            bb = bitboards[color, piece_type]
+            if bb == 0:
+                continue
+
+            count = 0
+            sum_mg = 0
+            sum_eg = 0
+            piece_table_mg = table_mg[piece_type]
+            piece_table_eg = table_eg[piece_type]
+            remaining = bb
+            while remaining:
+                lsb = remaining & (-remaining)
+                square = 0
+                temp = lsb
+                while temp > np.uint64(1):
+                    temp >>= np.uint64(1)
+                    square += 1
+                sum_mg += piece_table_mg[square]
+                sum_eg += piece_table_eg[square]
+                count += 1
+                remaining ^= lsb
+
+            phase += phase_weight[piece_type] * count
+            mg += sign * piece_value_mg[piece_type] * count
+            eg += sign * piece_value_eg[piece_type] * count
+            if piece_type == 3 and count >= 2:  # chess.BISHOP == 3
+                mg += sign * bishop_pair_mg
+                eg += sign * bishop_pair_eg
+            mg += sign * sum_mg
+            eg += sign * sum_eg
+
+    return mg, eg, phase
+
 
 def evaluate(board, alpha=-INFINITY, beta=INFINITY):
     """Static evaluation in centipawns, from the side to move's point of view.
@@ -463,40 +528,35 @@ def evaluate(board, alpha=-INFINITY, beta=INFINITY):
     white_pawns = board.pawns & white
     black_pawns = board.pawns & black
 
-    mg = 0
-    eg = 0
-    phase = 0
+    # ---- pass 1: material, PST, bishop pair (jitted) -----------------------
+    # bitboards[0] is Black's row and bitboards[1] White's, matching
+    # int(chess.BLACK)/int(chess.WHITE) - plain 0/1 indices, not the bool
+    # constants themselves. A bare True/False in a numpy index tuple is
+    # boolean masking, not integer indexing, and raises exactly this
+    # confusingly-shaped IndexError.
+    bitboards = np.empty((2, 7), dtype=np.uint64)
+    black_row = bitboards[0]
+    white_row = bitboards[1]
+    black_row[chess.PAWN] = black_pawns
+    white_row[chess.PAWN] = white_pawns
+    black_row[chess.KNIGHT] = board.knights & black
+    white_row[chess.KNIGHT] = board.knights & white
+    black_row[chess.BISHOP] = board.bishops & black
+    white_row[chess.BISHOP] = board.bishops & white
+    black_row[chess.ROOK] = board.rooks & black
+    white_row[chess.ROOK] = board.rooks & white
+    black_row[chess.QUEEN] = board.queens & black
+    white_row[chess.QUEEN] = board.queens & white
+    black_row[chess.KING] = board.kings & black
+    white_row[chess.KING] = board.kings & white
 
-    # ---- pass 1: material, PST, bishop pair -------------------------------
-    for color in (chess.WHITE, chess.BLACK):
-        sign = 1 if color else -1
-        pst_mg = PST_MG[color]
-        pst_eg = PST_EG[color]
-
-        for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP,
-                           chess.ROOK, chess.QUEEN, chess.KING):
-            bb = board.pieces_mask(piece_type, color)
-            if not bb:
-                continue
-
-            count = bb.bit_count()
-            phase += PHASE_WEIGHT[piece_type] * count
-            mg += sign * PIECE_VALUE_MG[piece_type] * count
-            eg += sign * PIECE_VALUE_EG[piece_type] * count
-
-            if piece_type == chess.BISHOP and count >= 2:
-                mg += sign * BISHOP_PAIR_MG
-                eg += sign * BISHOP_PAIR_EG
-
-            table_mg = pst_mg[piece_type]
-            table_eg = pst_eg[piece_type]
-            sum_mg = 0
-            sum_eg = 0
-            for square in chess.scan_forward(bb):
-                sum_mg += table_mg[square]
-                sum_eg += table_eg[square]
-            mg += sign * sum_mg
-            eg += sign * sum_eg
+    mg, eg, phase = _jit_material_pst(
+        bitboards, PST_MG_NP, PST_EG_NP, PIECE_VALUE_MG_NP, PIECE_VALUE_EG_NP,
+        PHASE_WEIGHT_NP, BISHOP_PAIR_MG, BISHOP_PAIR_EG,
+    )
+    mg = int(mg)
+    eg = int(eg)
+    phase = int(phase)
 
     if phase > MAX_PHASE:
         phase = MAX_PHASE
