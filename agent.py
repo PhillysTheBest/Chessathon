@@ -520,6 +520,32 @@ class Searcher:
 
 SEARCH = Searcher()
 
+
+def _telemetry_snapshot():
+    """A copy of SEARCH's 0b move-ordering counters, for taking a delta
+    across a single root candidate's own subtree (see _root_window's trace
+    hook below). Only ever called when a trace hook is in use - never in
+    real play."""
+    return {
+        "cutoff_at_index": list(SEARCH.cutoff_at_index),
+        "tt_move_cutoffs": SEARCH.tt_move_cutoffs,
+        "total_cutoffs": SEARCH.total_cutoffs,
+        "nmp_cutoffs": SEARCH.nmp_cutoffs,
+        "nmp_tries": SEARCH.nmp_tries,
+        "lmr_full_researches": SEARCH.lmr_full_researches,
+        "lmr_reductions": SEARCH.lmr_reductions,
+    }
+
+
+def _telemetry_delta(before):
+    after = _telemetry_snapshot()
+    delta = {k: after[k] - before[k] for k in after if k != "cutoff_at_index"}
+    delta["cutoff_at_index"] = [
+        a - b for a, b in zip(after["cutoff_at_index"], before["cutoff_at_index"],
+                               strict=True)
+    ]
+    return delta
+
 # =============================================================================
 # EVALUATION
 # =============================================================================
@@ -1860,12 +1886,23 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
 # =============================================================================
 
 
-def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
+def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack,
+                  trace=None):
     """Search every root move once inside (alpha, beta).
 
     Returns (move, score, finished, failed_high). A score at or below alpha is
     a fail low and a score at or above beta a fail high; either means the window
     was wrong and the caller has to widen it and come back.
+
+    trace, when given, is called once per candidate as trace(depth, index,
+    move, info) - info is a dict with score (None if TimeUp hit before this
+    candidate's search finished), nodes, elapsed_s, completed, is_first (this
+    candidate went first in move order - the closest thing to "was it the
+    root TT/PV move" at this level), and a telemetry delta (0b's SEARCH
+    counters, scoped to just this candidate's own subtree). Every real-play
+    call site leaves this None - analysis-only, and verified inert when unset
+    with the same fixed-depth parity technique used for every other optional
+    argument in this file (mg_eg_phase, key, ...).
     """
     iter_move = None
     iter_score = -INFINITY
@@ -1876,8 +1913,14 @@ def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
     for index, move in enumerate(ordered):
         zpre = _zobrist_pre(board, move)
         child_mg_eg_phase = _child_eval(board, move, root_mg_eg_phase)
+        if trace is not None:
+            nodes_before = SEARCH.nodes
+            trace_t0 = time.perf_counter()
+            tel_before = _telemetry_snapshot()
         board.push(move)
         child_key = _zobrist_post(board, root_key, zpre)
+        timed_out = False
+        score = None
         try:
             if index == 0:
                 score = -negamax(board, depth - 1, -beta, -alpha, 1, move,
@@ -1889,7 +1932,7 @@ def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
                     score = -negamax(board, depth - 1, -beta, -alpha, 1, move,
                                      key=child_key, mg_eg_phase=child_mg_eg_phase)
         except TimeUp:
-            return iter_move, iter_score, False, False
+            timed_out = True
         finally:
             # Unwind to our own depth rather than popping once. When TimeUp is
             # raised deep in the tree it propagates straight through the move
@@ -1900,6 +1943,20 @@ def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
             # about the wrong position.
             while len(board.move_stack) > base_stack:
                 board.pop()
+            if trace is not None:
+                info = {
+                    "score": score,
+                    "nodes": SEARCH.nodes - nodes_before,
+                    "elapsed_s": time.perf_counter() - trace_t0,
+                    "completed": not timed_out,
+                    "is_first": index == 0,
+                    "telemetry": _telemetry_delta(tel_before),
+                }
+                trace(depth, index, move, info)
+
+        if timed_out:
+            return iter_move, iter_score, False, False
+        assert score is not None  # not timed_out means the try block completed
 
         if score > iter_score:
             iter_score = score
@@ -1915,8 +1972,12 @@ def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
     return iter_move, iter_score, True, False
 
 
-def search_root(board, soft_s, hard_s):
-    """Iterative deepening. Returns (move, score, depth, pv)."""
+def search_root(board, soft_s, hard_s, trace=None):
+    """Iterative deepening. Returns (move, score, depth, pv).
+
+    trace is passed straight through to _root_window - see that function's
+    docstring. None at the real get_move() call site; analysis-only.
+    """
     start = time.perf_counter()
     SEARCH.hard_deadline = start + hard_s
     SEARCH.soft_deadline = start + soft_s
@@ -1961,7 +2022,8 @@ def search_root(board, soft_s, hard_s):
 
         while True:
             iter_move, iter_score, finished, failed_high = _root_window(
-                board, root_moves, best_move, depth, alpha, beta, base_stack)
+                board, root_moves, best_move, depth, alpha, beta, base_stack,
+                trace=trace)
             if not finished or delta == 0:
                 break
             if failed_high:
