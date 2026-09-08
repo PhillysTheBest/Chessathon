@@ -187,7 +187,7 @@ of phantom loss on moves that were in fact best. If a move where played equals
 best does not report exactly 0 loss, the methodology is broken.
 
 `analysis/positions.epd` is the scenario suite: a FEN plus a move that must be
-found (`bm`) or must not be played (`am`), grouped by theme. Currently 14/17.
+found (`bm`) or must not be played (`am`), grouped by theme. Currently 14/18.
 Add a line whenever a rated game exposes a weakness. `kingsafety` and `endgame`
 are the thinnest themes. The suite's wall-clock timing has real run-to-run
 noise near a depth-completion boundary — before concluding a code change
@@ -432,6 +432,50 @@ left the board several plies deep afterward with no error at all — fixed by
 unwinding to the pre-candidate stack depth in a `finally`, the same
 invariant `_root_window` already protects in `agent.py` itself.
 
+- **Round 72** was lost by checkmate as Black. A different profile from every
+  prior loss: **nothing crossed the 150cp blunder threshold anywhere in the
+  game.** The score sat near-equal through move 16, then move 17 (`Bg4`
+  played, −114, vs `Bxe4`, +2 — a 116cp gap, just under threshold) never
+  recovered, degrading further from move ~40 into a lost rook ending — round
+  49's "being outplayed" profile, with a much clearer starting point than
+  round 49 had. `Bg4`'s refutation is shallow (`Qxf4` two plies later,
+  grabbing a hanging pawn), and `Bxe4`'s true value (+2, not the +423 a
+  static snapshot after it suggests) is exactly the single-square exchange
+  `see()` is built to resolve — unlike round 68, not a clean "needs many
+  plies" case. The real game spent its slowest move of the entire game (7.2s)
+  on this exact position and still chose wrong; the platform's log
+  truncation destroyed the trace that would explain why, which motivated
+  building `analysis/trace.py` (below).
+- **Round 74** was lost by checkmate as White. Unlike round 72, a confirmed
+  real blunder: move 36, `Kh1` scores −837 against `Kg1`'s −453 (384cp).
+  Same signature as round 68 again — static eval right after each move is
+  nearly tied (`Kh1` −352 vs `Kg1` −365, 13cp apart) — a fourth confirmed
+  instance of the round-46/62/68 failure family (forced sequence past
+  reached depth), not a fifth pattern. Specifically: `Kh1` invites `...e3+`,
+  which forces `Kg1` anyway but from a worse position, because of what the
+  inserted tempo let Black set up first (PV `e3+ Kg1 Nf6 Rxg7+ Kf8 Rf7+ Qxf7
+  Qxh6+ Qg7+ Qxg7+`). A replay-faithful `analysis.trace` of this exact
+  position hit 13 replay-state mismatches earlier in this sharp game
+  (round 72's trace had 1) and found only a razor-thin −588 vs −592 gap at
+  the deepest depth reached — this position's difficulty is real even for
+  search itself, not just an artifact of `analysis.blunders`' reset-state
+  methodology. Both rounds' regression positions are in the suite.
+
+`analysis/trace.py` was added this session, built on an optional trace
+callback threaded through `search_root`/`_root_window` in `agent.py` (`None`
+at the real `get_move()` call site, verified inert with the usual
+fixed-depth parity technique). Replays a real PGN from the start via real
+`get_move()` calls — not `analysis.blunders`' deliberately reset TT/killers/
+history/counters — so a traced position's search runs under the same
+accumulated state and the same real clock (read from the PGN's own `%clk`
+annotations) a tournament game actually had, then reports every root
+candidate's score/nodes/time/completion/telemetry at every depth, not just
+the eventual winner. Its own central limitation, surfaced on the first two
+real uses: replaying via real wall-clock timing can diverge from what the
+original game's search reached at an earlier move (round 72: 1 mismatch;
+round 74: 13, in a much sharper game), so a replayed trace is informative,
+not a certified reconstruction of what the original tournament run computed.
+
 ### Measured profile
 
 Nodes per second was 9-11k before this session's jits; roughly 15-25k after,
@@ -467,8 +511,12 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
 1. **Recapture and threat extensions.** Cheap, and aimed at the round 46/62
    failure mode more directly than the forced-reply extension already shipped
    (which helps only when a node narrows to exactly one legal reply). Round 68
-   moves 39/43 (see above) are now a third confirmed instance of this exact
-   failure mode, not just two.
+   moves 39/43 and round 74 move 36 (see above) are now a fourth confirmed
+   instance of this exact failure mode, not just two — every one of them a
+   forced sequence the search only resolves several plies past where a
+   static-eval comparison would call the position a near-tie. This is now
+   the single most repeated finding in the postmortem history and should
+   move up from "priority 1 on a list" to "actually build it next."
 2. **Measure whether the forced-reply extension is a net positive** across
    ordinary games, not just the two adversarial cases that motivated it. It's
    verified sound and triggers correctly; strength effect is genuinely unknown.

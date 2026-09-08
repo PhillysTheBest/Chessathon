@@ -56,3 +56,19 @@ r3kb1r/pp1b1ppp/4p3/3pP3/P2N1P2/3Q4/1qPBK1PP/R6R b kq - 3 15 ; id "r46: Bc5 lose
 # Kept as "regression" rather than a new "endgame" theme for that reason.
 8/pR3b1k/3R3p/4P3/2p5/2r1K2P/6P1/5r2 w - - 0 39 ; id "r68 m39: Kd2 loses the king race, play Ke4" ; theme regression ; am Kd2
 8/R4b1k/3RP2p/8/2p5/2K4P/6P1/2rr4 w - - 3 43 ; id "r68 m43: Kb2 mis-steps, play Kb4" ; theme regression ; am Kb2
+# Round 74, lost by checkmate as White. A confirmed real blunder, unlike r72:
+# move 36, Kh1 scores -837 against Kg1's -453 (384cp, well past threshold).
+# Same signature as r68 again - static eval right after each move is nearly
+# tied (Kh1 -352 vs Kg1 -365, 13cp apart) - the true gap is a forced sequence
+# several plies deeper. Specifically here: Kh1 invites ...e3+, which forces
+# Kg1 anyway (transposing back to a position resembling the "best" line) but
+# WORSE, because of what the inserted ...e3+ tempo let Black set up first
+# (PV from Kh1: e3+ Kg1 Nf6 Rxg7+ Kf8 Rf7+ Qxf7 Qxh6+ Qg7+ Qxg7+). Same
+# failure family as r46/r62/r68 (forced sequence past reached depth), now a
+# fourth confirmed instance. A replay-faithful analysis.trace of this exact
+# position found 13 replay-state mismatches earlier in this sharp game
+# (compare r72's single mismatch) and, unlike r72, only a razor-thin -588 vs
+# -592 gap at the deepest depth reached - this position's true difficulty is
+# real even for search itself, not just a byproduct of analysis.blunders'
+# reset-state methodology.
+4n1k1/p1p3p1/7p/3qB2Q/4p3/6RP/5r1K/8 w - - 0 36 ; id "r74 m36: Kh1 invites ...e3+, play Kg1" ; theme regression ; am Kh1
