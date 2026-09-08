@@ -131,7 +131,7 @@ done.
 | v1.7 over v1.6 — staged TT-move-first search | inconclusive: 43.8% over 40 games, within noise; kept, not reverted (see §4) |
 | v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast-clock arena was noise (51.2%/40 games, expected at that clock); kept on the strength of a bit-exact correctness proof instead |
 | v1.9 over v1.8 — forced-reply extension, numba mobility/king-zone jit, incremental Zobrist | not arena-confirmed at all, individually or combined, given a tournament deadline; each verified to the strongest correctness standard available for its kind (see §4) |
-| `hybrid-engine-state` branch over v1.9 (unmerged) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed; each phase verified to a correctness standard instead (see §4). Built at explicit user request, overriding an earlier "not worth the risk" rejection of this architecture. |
+| v20 over v1.9 (merged to main) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed; each phase verified to a correctness standard instead (see §4). Built at explicit user request, overriding an earlier "not worth the risk" rejection of this architecture. |
 | Aspiration windows | −15.6% nodes to depth 8; **lost the arena, 42.5%, with one game lost by flagging** — rejected, still disabled |
 
 ---

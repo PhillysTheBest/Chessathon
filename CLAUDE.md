@@ -219,15 +219,16 @@ this was discovered was measured in the shallow regime only.
 | v1.7 over v1.6 — staged TT-move-first search | inconclusive: 43.8% over 40 games, within noise; kept, not reverted |
 | v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast-clock arena was noise (51.2%/40 games, expected at that clock); kept on a bit-exact correctness proof instead |
 | v1.9 over v1.8 — forced-reply extension, numba mobility/king-zone jit, incremental Zobrist | not arena-confirmed at all, given a tournament deadline; each verified to the strongest correctness standard available for its kind instead (bit-exact parity, debug-assert against `chess.polyglot.zobrist_hash`, or direct before/after comparison) |
-| `hybrid-engine-state` branch over v1.9 (unmerged) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed (see below); each phase verified to a correctness standard instead |
+| v20 over v1.9 (merged to main) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed (see below); each phase verified to a correctness standard instead |
 
-`submission.zip` is rebuilt from the current tree, not from a version proven to
-beat the ladder — none of v1.7-v1.9, nor the `hybrid-engine-state` branch, have
-arena confirmation, only correctness verification. Rebuild it
-(`uv run python -m harness.package`) and verify it runs standalone from a clean
-extract before treating it as ready to upload.
+`submission.zip` is rebuilt from the current tree (main), not from a version
+proven to beat the ladder — none of v1.7-v20 have arena confirmation, only
+correctness verification. Rebuild it (`uv run python -m harness.package`) and
+verify it runs standalone from a clean extract before treating it as ready to
+upload.
 
-**The `hybrid-engine-state` branch, in more detail.** Built at the user's
+**v20 (the former `hybrid-engine-state` branch, now merged), in more detail.**
+Built at the user's
 explicit request to override "Not doing further"'s rejection (below) of a
 hybrid engine-state architecture, given a live tournament deadline. Three
 phases landed, each independently verified rather than arena-tested:
@@ -495,15 +496,19 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
 8. **Fix and re-enable aspiration windows.** Two defects first: the re-search
    loop never checks the clock, and `search_root` accepts a fail-low's move
    even though it's only an upper bound.
-9. ~~TT as typed arrays~~ — done, see the `hybrid-engine-state` branch entry
-   above.
+9. ~~TT as typed arrays~~ — done, see the v20 entry above.
 10. **Extend staged move generation to captures** (`generate_legal_captures()`
     searched before the full legal-move list is ever built, past the existing
-    TT-move-first stage). Sketched out on the `hybrid-engine-state` branch but
-    not implemented: unlike that branch's other three phases, this changes
-    *which* nodes get visited and cached — the same risk class `v1.7`'s
-    staged TT-move-first search turned out to belong to — so it needs a real
-    40-game arena, not a correctness proof, before it ships.
+    TT-move-first stage). Sketched out during the v20 work but not
+    implemented: unlike v20's other three phases, this changes *which* nodes
+    get visited and cached — the same risk class `v1.7`'s staged TT-move-first
+    search turned out to belong to — so it needs a real 40-game arena, not a
+    correctness proof, before it ships.
+11. **Arena-confirm v20's history aging** (`HISTORY_AGING_ENABLED`, disabled
+    by default in the shipped code): a bounded gravity update + malus for
+    HISTORY, built and verified inert when off, never arena-tested. A spot
+    check was started and interrupted by a rated-game postmortem (round 68)
+    and not resumed.
 
 **Not doing further, and why:**
 
@@ -521,10 +526,10 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
   merits (comparable theoretical payoff to numba, much higher correctness
   risk: state that must stay synchronized across every move type — captures,
   castling, en passant, promotion), but was overridden at the user's explicit
-  request despite the live tournament clock; see the `hybrid-engine-state`
-  branch entry above for what shipped and how it was verified instead of
-  arena-tested. `chess.Board` stayed the sole legality/correctness oracle
-  throughout — nothing here reimplements movegen or legality.
+  request despite the live tournament clock; see the v20 entry above for what
+  shipped and how it was verified instead of arena-tested. `chess.Board`
+  stayed the sole legality/correctness oracle throughout — nothing here
+  reimplements movegen or legality.
 
 **Ongoing, not a single item:**
 
