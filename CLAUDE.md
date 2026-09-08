@@ -391,13 +391,22 @@ more tuning rather than after another loss:
   than one extra ply there. Regression case in the suite.
 - **Round 68** was lost by checkmate from a roughly balanced position out of a
   sound piece sac (Bxg6/Qxg6 around move 19, confirmed only 18cp off the
-  alternative). Not a round-46/round-62 style single horizon miss: a long run
-  of 20-90cp second-best rook-endgame moves, same profile as round 49, then
-  two real king-activity errors in the resulting K+R(+pawns) ending (move 39
-  `Kd2`, -188cp against `Ke4`; move 43 `Kb2`, -176cp against `Kb4`). Both
-  regression cases in the suite. Reinforces "endgame" as the thinnest theme,
-  the same king-activity judgment as the still-unverified "take the
-  opposition" entry — not a coincidence, and not a one-off.
+  alternative). A long run of 20-90cp second-best rook-endgame moves (round
+  49's profile), then two moves confirmed as real losses (move 39 `Kd2`,
+  -188cp against `Ke4`; move 43 `Kb2`, -176cp against `Kb4`). **Initially read
+  as a king-activity/evaluation problem; a term-by-term eval breakdown of
+  both positions overturned that.** The static evaluation right after each
+  move is nearly tied (Kd2 -300 vs Ke4 -278; Kb2 -130 vs Kb4 -128 — low tens
+  of cp apart, not the 176-188cp the search eventually finds). The real gap
+  is a forced sequence invisible at that depth: a rook infiltration via
+  checks after `Kd2` (PV `Rg3 Ke2 Rf5 e6 Rxg2+ Ke3 Rg3+ Ke4`), a
+  tempo-gaining `...c3+` pawn race after `Kb2`. **Same failure family as
+  round 46/round 62 (a forced sequence a few plies past where the search
+  looked), not a distinct endgame-evaluation weakness** — both regression
+  cases stay filed as "regression," not "endgame," for that reason. The
+  already-open recapture/threat-extension item (Open Work below) targets
+  this failure mode directly and is now additionally motivated by round 68,
+  not just 46/62.
 
 `analysis/blunders.py` was rebuilt this session around round 68: the old
 version scored *every* legal move at *every* our-move with an independent
@@ -456,7 +465,9 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
 
 1. **Recapture and threat extensions.** Cheap, and aimed at the round 46/62
    failure mode more directly than the forced-reply extension already shipped
-   (which helps only when a node narrows to exactly one legal reply).
+   (which helps only when a node narrows to exactly one legal reply). Round 68
+   moves 39/43 (see above) are now a third confirmed instance of this exact
+   failure mode, not just two.
 2. **Measure whether the forced-reply extension is a net positive** across
    ordinary games, not just the two adversarial cases that motivated it. It's
    verified sound and triggers correctly; strength effect is genuinely unknown.
