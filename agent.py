@@ -738,7 +738,22 @@ def _piece_bitboards(board):
     return bitboards
 
 
-def evaluate(board, alpha=-INFINITY, beta=INFINITY):
+def _material_pst_phase(board):
+    """Fresh (mg, eg, phase): the raw, unclamped pass-1 output evaluate()'s
+    jitted material/PST/bishop-pair pass always computed inline, factored out
+    so search_root/_root_window can seed the incremental mg_eg_phase value
+    threaded through negamax/qsearch (see the INCREMENTAL EVALUATION section
+    below) without duplicating this block a second time.
+    """
+    bitboards = _piece_bitboards(board)
+    mg, eg, phase = _jit_material_pst(
+        bitboards, PST_MG_NP, PST_EG_NP, PIECE_VALUE_MG_NP, PIECE_VALUE_EG_NP,
+        PHASE_WEIGHT_NP, BISHOP_PAIR_MG, BISHOP_PAIR_EG,
+    )
+    return int(mg), int(eg), int(phase)
+
+
+def evaluate(board, alpha=-INFINITY, beta=INFINITY, mg_eg_phase=None):
     """Static evaluation in centipawns, from the side to move's point of view.
 
     Two passes. The first is material, piece-square tables and the bishop pair,
@@ -750,22 +765,35 @@ def evaluate(board, alpha=-INFINITY, beta=INFINITY):
     the case this is for.
 
     Passing no window forces the full evaluation.
+
+    mg_eg_phase, when given, is the pass-1 output already maintained
+    incrementally by the caller (see _eval_delta / _child_eval below) - pass
+    1 then skips _material_pst_phase's recompute entirely. Every call site
+    that does not thread it still gets a correct pass 1, just a slower one:
+    same invariant as the incremental Zobrist key.
     """
     white = board.occupied_co[chess.WHITE]
     black = board.occupied_co[chess.BLACK]
     white_pawns = board.pawns & white
     black_pawns = board.pawns & black
-
-    # ---- pass 1: material, PST, bishop pair (jitted) -----------------------
+    # Needed by pass 2's mobility jit below whenever pass 2 runs at all, so
+    # built unconditionally regardless of whether pass 1 uses the incremental
+    # mg_eg_phase or recomputes fresh.
     bitboards = _piece_bitboards(board)
 
-    mg, eg, phase = _jit_material_pst(
-        bitboards, PST_MG_NP, PST_EG_NP, PIECE_VALUE_MG_NP, PIECE_VALUE_EG_NP,
-        PHASE_WEIGHT_NP, BISHOP_PAIR_MG, BISHOP_PAIR_EG,
-    )
-    mg = int(mg)
-    eg = int(eg)
-    phase = int(phase)
+    # ---- pass 1: material, PST, bishop pair --------------------------------
+    if mg_eg_phase is not None and not EVAL_ASSERT:
+        mg, eg, phase = mg_eg_phase
+    else:
+        mg, eg, phase = _jit_material_pst(
+            bitboards, PST_MG_NP, PST_EG_NP, PIECE_VALUE_MG_NP, PIECE_VALUE_EG_NP,
+            PHASE_WEIGHT_NP, BISHOP_PAIR_MG, BISHOP_PAIR_EG,
+        )
+        mg, eg, phase = int(mg), int(eg), int(phase)
+        if EVAL_ASSERT and mg_eg_phase is not None:
+            assert (mg, eg, phase) == mg_eg_phase, (
+                board.fen(), (mg, eg, phase), mg_eg_phase,
+            )
 
     if phase > MAX_PHASE:
         phase = MAX_PHASE
@@ -1231,13 +1259,127 @@ def _zobrist_post(board, key, pre):
 
 
 # =============================================================================
+# INCREMENTAL EVALUATION
+# =============================================================================
+# evaluate()'s pass 1 (material, PST, bishop pair) recomputes from scratch on
+# every call, and qsearch alone calls evaluate() at nearly every leaf. This
+# maintains that pass's (mg, eg, phase) incrementally through push/pop instead,
+# the same shape as the incremental Zobrist key above: a delta computed from
+# `board` before a move is pushed, folded into the running total, threaded as
+# an optional argument through negamax/qsearch/_root_window. A call site that
+# does not thread it still gets a correct pass 1 out of evaluate() - just a
+# slower, freshly recomputed one - never a wrong one; see evaluate()'s own
+# docstring for that invariant stated the same way it already is for the key.
+#
+# mg/eg/phase here are the same *raw, unclamped* values _material_pst_phase
+# returns - the MAX_PHASE clamp is applied in evaluate() itself, identically
+# whether that pass-1 output arrived incrementally or fresh.
+EVAL_ASSERT = False  # debug only: recomputes and asserts on every push
+
+
+def _eval_delta(board, move):
+    """(mg_delta, eg_delta, phase_delta) for `move`, not yet pushed onto
+    `board`. A structural twin of _piece_square_delta above, with the
+    material/phase/bishop-pair components _piece_square_delta doesn't need
+    (Zobrist has no positional-bonus term) added on top of the same
+    piece-square shape: a piece leaves from_square and arrives at to_square
+    (possibly promoted), a captured or en-passant-captured piece is removed,
+    and castling also moves the rook. A null move (from_square == to_square)
+    changes nothing.
+
+    Unlike _piece_square_delta this needs no post-push state, so there is no
+    separate _eval_post: everything it needs is readable before the push.
+    """
+    if move.from_square == move.to_square:
+        return 0, 0, 0
+
+    from_sq = move.from_square
+    to_sq = move.to_square
+    color = board.turn  # the mover
+    sign = 1 if color else -1
+    piece_type = board.piece_type_at(from_sq)
+    new_type = move.promotion or piece_type
+
+    mg = sign * (PST_MG[color][new_type][to_sq] - PST_MG[color][piece_type][from_sq])
+    eg = sign * (PST_EG[color][new_type][to_sq] - PST_EG[color][piece_type][from_sq])
+    phase = 0
+
+    if move.promotion:
+        mg += sign * (PIECE_VALUE_MG[new_type] - PIECE_VALUE_MG[chess.PAWN])
+        eg += sign * (PIECE_VALUE_EG[new_type] - PIECE_VALUE_EG[chess.PAWN])
+        phase += PHASE_WEIGHT[new_type] - PHASE_WEIGHT[chess.PAWN]
+        if new_type == chess.BISHOP:
+            # A second bishop turns the pair bonus on; a first or third+
+            # doesn't change it.
+            our_bishops = (board.bishops & board.occupied_co[color]).bit_count()
+            if our_bishops == 1:
+                mg += sign * BISHOP_PAIR_MG
+                eg += sign * BISHOP_PAIR_EG
+
+    if board.is_en_passant(move):
+        captured_sq = to_sq + (-8 if color else 8)
+        their_sign = -sign
+        mg -= their_sign * (PST_MG[not color][chess.PAWN][captured_sq]
+                             + PIECE_VALUE_MG[chess.PAWN])
+        eg -= their_sign * (PST_EG[not color][chess.PAWN][captured_sq]
+                             + PIECE_VALUE_EG[chess.PAWN])
+        # A pawn's phase weight is 0 and it can't be one half of a bishop
+        # pair, so neither needs handling here.
+    else:
+        captured_type = board.piece_type_at(to_sq)
+        if captured_type is not None:
+            their_color = not color
+            their_sign = -sign
+            mg -= their_sign * (PST_MG[their_color][captured_type][to_sq]
+                                 + PIECE_VALUE_MG[captured_type])
+            eg -= their_sign * (PST_EG[their_color][captured_type][to_sq]
+                                 + PIECE_VALUE_EG[captured_type])
+            phase -= PHASE_WEIGHT[captured_type]
+            if captured_type == chess.BISHOP:
+                # Dropping from exactly 2 bishops to 1 turns the pair bonus
+                # off; dropping from 3+ to 2+, or from 1 to 0, doesn't.
+                their_bishops = (
+                    board.bishops & board.occupied_co[their_color]).bit_count()
+                if their_bishops == 2:
+                    mg -= their_sign * BISHOP_PAIR_MG
+                    eg -= their_sign * BISHOP_PAIR_EG
+
+    if board.is_castling(move):
+        queenside = chess.square_file(to_sq) < chess.square_file(from_sq)
+        rank = chess.A1 if color else chess.A8
+        rook_from = rank if queenside else rank + 7
+        rook_to = (rank + 3) if queenside else (rank + 5)
+        mg += sign * (PST_MG[color][chess.ROOK][rook_to]
+                      - PST_MG[color][chess.ROOK][rook_from])
+        eg += sign * (PST_EG[color][chess.ROOK][rook_to]
+                      - PST_EG[color][chess.ROOK][rook_from])
+
+    return mg, eg, phase
+
+
+def _child_eval(board, move, mg_eg_phase):
+    """mg_eg_phase for the position after `move`, not yet pushed onto
+    `board`, or None if the caller has no incremental value to propagate -
+    evaluate() then falls back to a full recompute, as it always did before
+    this existed. Call before board.push(move), like _zobrist_pre."""
+    if mg_eg_phase is None:
+        return None
+    mg_delta, eg_delta, phase_delta = _eval_delta(board, move)
+    return (
+        mg_eg_phase[0] + mg_delta,
+        mg_eg_phase[1] + eg_delta,
+        mg_eg_phase[2] + phase_delta,
+    )
+
+
+# =============================================================================
 # QUIESCENCE
 # =============================================================================
 
 DELTA_MARGIN = 200
 
 
-def qsearch(board, alpha, beta, ply):
+def qsearch(board, alpha, beta, ply, mg_eg_phase=None):
     SEARCH.nodes += 1
     SEARCH.qnodes += 1
     SEARCH.check_time()
@@ -1245,7 +1387,7 @@ def qsearch(board, alpha, beta, ply):
     if ply > SEARCH.seldepth:
         SEARCH.seldepth = ply
     if ply >= MAX_PLY - 1:
-        return evaluate(board)
+        return evaluate(board, mg_eg_phase=mg_eg_phase)
 
     in_check = board.is_check()
     key = None
@@ -1267,7 +1409,7 @@ def qsearch(board, alpha, beta, ply):
         moves = order_moves(board, moves, None, ply, None)
         best = -INFINITY
     else:
-        stand_pat = evaluate(board, alpha, beta)
+        stand_pat = evaluate(board, alpha, beta, mg_eg_phase)
         if stand_pat >= beta:
             return stand_pat
         if stand_pat > alpha:
@@ -1305,8 +1447,9 @@ def qsearch(board, alpha, beta, ply):
                 if see(board, move) < QS_SEE_THRESHOLD:
                     continue
 
+            child_mg_eg_phase = _child_eval(board, move, mg_eg_phase)
             board.push(move)
-            score = -qsearch(board, -beta, -alpha, ply + 1)
+            score = -qsearch(board, -beta, -alpha, ply + 1, child_mg_eg_phase)
             board.pop()
 
             if score > best:
@@ -1331,7 +1474,8 @@ RFP_MARGIN = 75
 LMP_COUNT = [0, 5, 8, 13, 20, 29, 40]
 
 
-def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None):
+def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None,
+            mg_eg_phase=None):
     SEARCH.nodes += 1
     SEARCH.check_time()
 
@@ -1354,7 +1498,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             return 0
 
     if ply >= MAX_PLY - 1:
-        return evaluate(board)
+        return evaluate(board, mg_eg_phase=mg_eg_phase)
 
     in_check = board.is_check()
 
@@ -1392,9 +1536,9 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 return score
 
     if depth <= 0:
-        return qsearch(board, alpha, beta, ply)
+        return qsearch(board, alpha, beta, ply, mg_eg_phase)
 
-    static_eval = -MATE_SCORE if in_check else evaluate(board)
+    static_eval = -MATE_SCORE if in_check else evaluate(board, mg_eg_phase=mg_eg_phase)
 
     # --- whole node pruning ------------------------------------------------
     if not is_pv and not in_check and abs(beta) < MATE_BOUND:
@@ -1414,8 +1558,12 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 board.push(chess.Move.null())
                 SEARCH.path.append(key)
                 try:
+                    # A null move changes nothing material/PST/phase-wise
+                    # (see _eval_delta's own null-move case), so the current
+                    # mg_eg_phase carries straight through unchanged.
                     score = -negamax(board, depth - reduction - 1, -beta,
-                                     -beta + 1, ply + 1, None, allow_null=False)
+                                     -beta + 1, ply + 1, None, allow_null=False,
+                                     mg_eg_phase=mg_eg_phase)
                 finally:
                     SEARCH.path.pop()
                     board.pop()
@@ -1424,7 +1572,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
 
     # --- internal iterative deepening -------------------------------------
     if tt_move is None and depth >= 4 and is_pv:
-        negamax(board, depth - 2, alpha, beta, ply, prev_move, allow_null, key)
+        negamax(board, depth - 2, alpha, beta, ply, prev_move, allow_null, key,
+                mg_eg_phase)
         tt_depth = int(TT_DEPTH[index])
         tt_hit = tt_depth >= 0 and int(TT_KEY[index]) == key
         if tt_hit:
@@ -1462,10 +1611,11 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             is_quiet = not is_capture and not move.promotion
 
             zpre = _zobrist_pre(board, move)
+            child_mg_eg_phase = _child_eval(board, move, mg_eg_phase)
             board.push(move)
             child_key = _zobrist_post(board, key, zpre)
             score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move,
-                             key=child_key)
+                             key=child_key, mg_eg_phase=child_mg_eg_phase)
             piece_type = board.piece_type_at(move.to_square)
             board.pop()
             searched = 1
@@ -1527,13 +1677,15 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                         continue
 
                 zpre = _zobrist_pre(board, move)
+                child_mg_eg_phase = _child_eval(board, move, mg_eg_phase)
                 board.push(move)
                 child_key = _zobrist_post(board, key, zpre)
                 gives_check = board.is_check()
 
                 if searched == 0:
                     score = -negamax(board, depth - 1 + one_reply_ext, -beta,
-                                     -alpha, ply + 1, move, key=child_key)
+                                     -alpha, ply + 1, move, key=child_key,
+                                     mg_eg_phase=child_mg_eg_phase)
                 else:
                     reduction = 0
                     if is_quiet and depth >= 3 and not gives_check and move_index >= 3:
@@ -1546,17 +1698,20 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                             reduction = depth - 2
 
                     score = -negamax(board, depth - 1 - reduction, -alpha - 1,
-                                     -alpha, ply + 1, move, key=child_key)
+                                     -alpha, ply + 1, move, key=child_key,
+                                     mg_eg_phase=child_mg_eg_phase)
 
                     # The reduced search beat alpha, so redo it at full depth.
                     if reduction > 0 and score > alpha:
                         score = -negamax(board, depth - 1, -alpha - 1, -alpha,
-                                         ply + 1, move, key=child_key)
+                                         ply + 1, move, key=child_key,
+                                         mg_eg_phase=child_mg_eg_phase)
 
                     # PVS re-search on a full window inside the bounds.
                     if alpha < score < beta:
                         score = -negamax(board, depth - 1, -beta, -alpha,
-                                         ply + 1, move, key=child_key)
+                                         ply + 1, move, key=child_key,
+                                         mg_eg_phase=child_mg_eg_phase)
 
                 piece_type = board.piece_type_at(move.to_square)
                 board.pop()
@@ -1633,21 +1788,23 @@ def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
     iter_score = -INFINITY
     ordered = order_moves(board, root_moves, best_move, 0, None)
     root_key = chess.polyglot.zobrist_hash(board)
+    root_mg_eg_phase = _material_pst_phase(board)
 
     for index, move in enumerate(ordered):
         zpre = _zobrist_pre(board, move)
+        child_mg_eg_phase = _child_eval(board, move, root_mg_eg_phase)
         board.push(move)
         child_key = _zobrist_post(board, root_key, zpre)
         try:
             if index == 0:
                 score = -negamax(board, depth - 1, -beta, -alpha, 1, move,
-                                 key=child_key)
+                                 key=child_key, mg_eg_phase=child_mg_eg_phase)
             else:
                 score = -negamax(board, depth - 1, -alpha - 1, -alpha, 1, move,
-                                 key=child_key)
+                                 key=child_key, mg_eg_phase=child_mg_eg_phase)
                 if alpha < score < beta:
                     score = -negamax(board, depth - 1, -beta, -alpha, 1, move,
-                                     key=child_key)
+                                     key=child_key, mg_eg_phase=child_mg_eg_phase)
         except TimeUp:
             return iter_move, iter_score, False, False
         finally:
