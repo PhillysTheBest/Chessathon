@@ -1553,39 +1553,6 @@ FUTILITY_MARGIN = [0, 100, 180, 280, 400, 540, 700]
 RFP_MARGIN = 75
 LMP_COUNT = [0, 5, 8, 13, 20, 29, 40]
 
-# Recapture extension, aimed at the round 46/62/68/74 failure mode more
-# directly than the forced-reply extension alone: every one of those was a
-# forced sequence the search resolved a ply too shallow, and a recapture is
-# exactly the kind of forcing continuation most likely to sit on that
-# critical path. "Threat extension" (giving check) was tried alongside this
-# and reverted before it ever got as far as an arena: a move that gives
-# check makes its child node's own is_check() true, and that child already
-# extends itself via the existing check-extension a few lines below (`if
-# in_check and ply < 40: depth += 1`) - adding a second +1 at the parent for
-# the same event double-counts every check in a game, and a scenario-suite
-# run with it in place blew a tactical position out to depth 0 in 3 seconds
-# (an already-known risk class - see analysis.trace's own discovery this
-# session of forced-reply/check-extension chains taking 170s+ at nominal
-# depth 7). Recapture has no such existing mechanism to collide with. Capped
-# by the same ply < 40 guard the existing check extension uses, since a
-# recapture is far more frequent than "in check" and stacking uncapped
-# extensions along a long forcing line is exactly how that blowup happens.
-# Already mutually exclusive with LMR reduction by construction: a recapture
-# is a capture, so is_quiet is False, and captures are never reduction-
-# eligible - never competes with a reduction for the same move.
-RECAPTURE_EXT_PLY_CAP = 40
-
-
-def _move_extension(move, prev_move, is_capture, ply):
-    """+1 ply for a move that recaptures on the square the opponent's last
-    move landed on. 0 past RECAPTURE_EXT_PLY_CAP, mirroring the existing
-    check extension's own ply cap."""
-    if ply >= RECAPTURE_EXT_PLY_CAP:
-        return 0
-    if is_capture and prev_move is not None and move.to_square == prev_move.to_square:
-        return 1
-    return 0
-
 
 def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None,
             mg_eg_phase=None):
@@ -1733,9 +1700,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             child_mg_eg_phase = _child_eval(board, move, mg_eg_phase)
             board.push(move)
             child_key = _zobrist_post(board, key, zpre)
-            move_ext = _move_extension(move, prev_move, is_capture, ply)
-            score = -negamax(board, depth - 1 + move_ext, -beta, -alpha, ply + 1,
-                             move, key=child_key, mg_eg_phase=child_mg_eg_phase)
+            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move,
+                             key=child_key, mg_eg_phase=child_mg_eg_phase)
             piece_type = board.piece_type_at(move.to_square)
             board.pop()
             searched = 1
@@ -1812,11 +1778,10 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 board.push(move)
                 child_key = _zobrist_post(board, key, zpre)
                 gives_check = board.is_check()
-                move_ext = _move_extension(move, prev_move, is_capture, ply)
 
                 if searched == 0:
-                    score = -negamax(board, depth - 1 + one_reply_ext + move_ext,
-                                     -beta, -alpha, ply + 1, move, key=child_key,
+                    score = -negamax(board, depth - 1 + one_reply_ext, -beta,
+                                     -alpha, ply + 1, move, key=child_key,
                                      mg_eg_phase=child_mg_eg_phase)
                 else:
                     reduction = 0
@@ -1829,8 +1794,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                         if reduction > depth - 2:
                             reduction = depth - 2
 
-                    score = -negamax(board, depth - 1 - reduction + move_ext,
-                                     -alpha - 1, -alpha, ply + 1, move, key=child_key,
+                    score = -negamax(board, depth - 1 - reduction, -alpha - 1,
+                                     -alpha, ply + 1, move, key=child_key,
                                      mg_eg_phase=child_mg_eg_phase)
 
                     # The reduced search beat alpha, so redo it at full depth.
@@ -1838,14 +1803,14 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                         SEARCH.lmr_reductions += 1
                         if score > alpha:
                             SEARCH.lmr_full_researches += 1
-                            score = -negamax(board, depth - 1 + move_ext, -alpha - 1,
-                                             -alpha, ply + 1, move, key=child_key,
+                            score = -negamax(board, depth - 1, -alpha - 1, -alpha,
+                                             ply + 1, move, key=child_key,
                                              mg_eg_phase=child_mg_eg_phase)
 
                     # PVS re-search on a full window inside the bounds.
                     if alpha < score < beta:
-                        score = -negamax(board, depth - 1 + move_ext, -beta,
-                                         -alpha, ply + 1, move, key=child_key,
+                        score = -negamax(board, depth - 1, -beta, -alpha,
+                                         ply + 1, move, key=child_key,
                                          mg_eg_phase=child_mg_eg_phase)
 
                 piece_type = board.piece_type_at(move.to_square)
