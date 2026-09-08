@@ -19,7 +19,9 @@ uv run ruff check . && uv run mypy              # the gate, must be clean before
 uv run python -m harness.package                # build submission.zip
 ```
 
-Playing and measuring:
+Playing and measuring (`baselines/philbert-v1X/` is illustrative syntax below —
+use the highest version number under `baselines/` for the actual current
+baseline):
 
 ```bash
 uv run python -m harness.play --white . --black baselines/philbert-v15 --pgn game.pgn
@@ -95,11 +97,15 @@ Pure Python over `python-chess` for move generation and legality. **Do not
 hand-roll a board representation.** An illegal move loses the game outright, and
 this was settled once already: `Philbert/PhilbertV1.py` is an earlier 5x5-variant
 engine with its own bitboards, kept as a design reference only. Nothing imports
-it, and ruff excludes it.
+it, and ruff excludes it. Where speed matters, code reads `python-chess`'s raw
+bitboard attributes directly (`board.pawns`, `board.occupied_co[color]`, ...)
+rather than the slower object-returning APIs (`piece_at`, `pieces`) — but the
+board itself, move generation, and legality all stay `python-chess`'s.
 
 `agent.py` is one file, laid out top to bottom as: tunables, piece values,
-piece-square tables, evaluation terms and precomputed masks, move-ordering
-tables, transposition table, search state, `evaluate`, move ordering, SEE,
+piece-square tables, evaluation terms and precomputed masks, numba-jitted
+material/PST/mobility helpers, move-ordering tables, transposition table,
+search state, `evaluate`, move ordering, SEE, incremental-Zobrist helpers,
 `qsearch`, `negamax`, `_root_window` / `search_root`, `OpponentTracker`,
 `compute_budget`, `get_move`, a warm-up that runs at import, and a `__main__`
 self-test the platform never executes.
@@ -107,16 +113,30 @@ self-test the platform never executes.
 **Search.** Negamax with alpha-beta and PVS, iterative deepening under a
 soft/hard time split that unwinds through a `TimeUp` exception. Transposition
 table of 2^20 buckets with exact/lower/upper flags and ply-adjusted mate scores.
-Quiescence with delta pruning and SEE cutoffs. Null-move pruning, LMR, LMP,
-futility, reverse futility, check extensions, internal iterative deepening.
-Ordering is TT move, then SEE-gated MVV-LVA captures, promotions, killers,
-counter-moves, history.
+Zobrist keys are computed incrementally in the hot recursive call sites
+(threaded as an optional argument that falls back to a full
+`chess.polyglot.zobrist_hash` recompute wherever not supplied — no call site
+can produce a *wrong* key, only a slower-but-correct one). A cached TT move is
+tried via the cheap `board.is_legal()` check before the full legal-move list is
+generated at all; only a miss pays for full generation and ordering. Quiescence
+with delta pruning and SEE cutoffs, plus its own draw/stalemate detection.
+Null-move pruning, LMR, LMP, futility, reverse futility, check extensions, a
+forced-reply extension (one legal move costs nothing extra to search one ply
+deeper), internal iterative deepening. Ordering is TT move, then SEE-gated
+MVV-LVA captures, promotions, killers, counter-moves, history.
 
-**Evaluation.** Tapered midgame/endgame on a phase count of 24. Material, PSTs,
-mobility, bishop pair, doubled/isolated/passed pawns, rook on open and half-open
-files, pawn shield, open files beside the king, king-attack danger on a quadratic
-curve. Lazy: skips the positional pass when material and PST already sit
-`LAZY_MARGIN` outside the caller's window.
+**Evaluation.** Tapered midgame/endgame on a phase count of 24. Material, PSTs
+and the bishop pair are numba-jitted (bit-exact against the prior pure-Python
+version). Mobility and the king-zone-attack term are also numba-jitted, via
+hand-rolled ray-casting for sliding pieces — `python-chess`'s own sliding-attack
+tables are Python dicts numba can't index efficiently, so this isn't reused
+directly, only verified against it (`board.attacks_mask()`) per-square before
+being trusted. Doubled/isolated/passed pawns, rook on open and half-open files,
+pawn shield, open files beside the king, and king-attack danger on a quadratic
+curve stay pure Python — cheap bitwise-mask operations with no attack
+generation, so jitting them doesn't pay off the same way. Lazy: skips the
+positional pass when material and PST already sit `LAZY_MARGIN` outside the
+caller's window.
 
 **Two invariants that are load-bearing.**
 
@@ -144,7 +164,21 @@ one ships, so the next change is measured against what it would actually replace
 
 **A 30-40 game arena has about +/- 7% standard error.** Only large effects are
 detectable. Treat 45-55% as no information. Re-run any winner before shipping.
-Picking the best of twelve noisy trials is how you overtune.
+Picking the best of twelve noisy trials is how you overtune. `--sprt` (see
+Commands) can shorten a clearly one-sided result but does not change this bar —
+a genuine toss-up still runs the full count.
+
+**A proof of bit-exact correctness can substitute for an arena, but only for
+changes that provably cannot alter *which* nodes get searched or *what*
+decision gets made at a given depth** — a numba rewrite of a pure function is
+the clean case: same inputs, same outputs, only faster, verified by comparing
+outputs across thousands of positions. The moment a change touches *when* a
+cutoff fires, *which* moves get generated, or *what* gets cached, node
+visitation order can shift, and LMR/NMP/futility are approximate enough that a
+different cache population can change a score by tens of centipawns even with
+identical logic — that class of change still needs the arena. (The staged
+TT-move-first search looked like the safe case and wasn't; see "What has been
+tried" below.)
 
 `analysis/blunders.py` replays a rated PGN and scores the move played and the
 best move **the same way** — push, search the child to a fixed depth, negate.
@@ -153,12 +187,22 @@ of phantom loss on moves that were in fact best. If a move where played equals
 best does not report exactly 0 loss, the methodology is broken.
 
 `analysis/positions.epd` is the scenario suite: a FEN plus a move that must be
-found (`bm`) or must not be played (`am`), grouped by theme. Currently 12/14.
+found (`bm`) or must not be played (`am`), grouped by theme. Currently 12/15.
 Add a line whenever a rated game exposes a weakness. `kingsafety` and `endgame`
-are the thinnest themes.
+are the thinnest themes. The suite's wall-clock timing has real run-to-run
+noise near a depth-completion boundary — before concluding a code change
+caused a flip, replay the exact same `search_root(soft, hard)` call before and
+after; if nodes/score/PV come back identical, it's noise, not a regression.
 
 `analysis/tune.py` builds a variant of `agent.py` with exactly one line
 rewritten, so an arena result attributes cleanly to one constant.
+
+**The arena's default clock (10s+0.1s) is a different regime than rated
+games.** A self-play game caps at depth 3-4 on that fast clock but reaches
+depth 6-8 on the realistic clock (120s+0.5s), matching rated-game play. Use the
+fast clock to screen, but **re-confirm any winner at `--base-ms 120000
+--increment-ms 500`** before it ships — every pruning-constant sweep before
+this was discovered was measured in the shallow regime only.
 
 ---
 
@@ -173,10 +217,13 @@ rewritten, so an arena result attributes cleanly to one constant.
 | v1.4 over v1.3 — lazy eval + SEE at threshold −110 | **70.0%** |
 | v1.6 over v1.5 — TT/check-extension depth fix, qsearch draw detection | safety fixes, sanity-checked only (12 games, 50.0%) |
 | v1.7 over v1.6 — staged TT-move-first search | inconclusive: 43.8% over 40 games, within noise; kept, not reverted |
-| v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast clock 51.2%/40 games (noise, expected — see below); realistic-clock confirmation pending |
+| v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast-clock arena was noise (51.2%/40 games, expected at that clock); kept on a bit-exact correctness proof instead |
+| v1.9 over v1.8 — forced-reply extension, numba mobility/king-zone jit, incremental Zobrist | not arena-confirmed at all, given a tournament deadline; each verified to the strongest correctness standard available for its kind instead (bit-exact parity, debug-assert against `chess.polyglot.zobrist_hash`, or direct before/after comparison) |
 
-`submission.zip` should be built from a version that has beaten the one on the
-ladder. As of the last session that is **v1.4**.
+`submission.zip` is rebuilt from the current tree, not from a version proven to
+beat the ladder — none of v1.7-v1.9 have arena confirmation, only correctness
+verification. Rebuild it (`uv run python -m harness.package`) and verify it
+runs standalone from a clean extract before treating it as ready to upload.
 
 ### The single most important result
 
@@ -204,28 +251,43 @@ between re-searches, and `search_root` accepts the move from a fail low even
 though it is only an upper bound. Fix both before re-enabling.
 
 **Lazy evaluation on its own.** 5-8%, not the large win its 42% profile share
-suggested, because the cheap pass still walks every piece. It needs an
-incrementally maintained material/PST total to pay properly.
+suggested, because the cheap pass still walks every piece. Superseded: material
+and PST are now numba-jitted from scratch rather than incrementally maintained
+in pure Python — comparable speedup, much lower correctness risk than hand-kept
+incremental state through push/pop across captures, castling, en passant and
+promotion.
 
-### Pruning constant sweep, 30 games each against v1.4
+**Staged TT-move-first search looked purely behavior-preserving and wasn't.** A
+fixed-depth-6 parity check from an empty TT found 3 of 10 random positions
+scored differently (12-76cp, no blunders) from the pre-change code. Not a bug:
+skipping full move generation after an early TT-move cutoff means some
+sub-nodes are never visited and never cached, and LMR/NMP/futility are
+approximate enough that a different set of cached moves elsewhere can shift a
+cold-TT score. Shipped anyway (43.8%/40 games, within noise, no correctness
+defects) — but the lesson stands: "this can only change speed" needs checking,
+not assuming, for anything that changes *which* nodes get visited, even without
+touching a pruning decision directly.
 
-| Variant | Score | Read |
-|---|---|---|
-| `rfp-40` (`RFP_MARGIN = 40`) | **61.7%** | promising, only 1.5 SE, needs confirming |
-| `rfp-120` | **20.0%** | clearly much worse, 3.9 SE below even |
-| `lmp-tight` | 55.0% | no information |
-| `lmp-loose` | 48.3% | null |
-| `lmr-aggr` / `lmr-shy` | 50.0% / 48.3% | null |
-| `see-60` / `see-200` | 48.3% / 43.3% | both worse, confirms -110 is near optimal |
+### Pruning constant sweep, 30-40 games each
 
-`RFP_MARGIN` is the one sensitive constant found: 40 -> 61.7%, 75 -> 50%,
-120 -> 20%. A clean monotonic gradient saying lower is better. The direction is
-solid even though 61.7% on its own is not, so test values below 40 as well.
+| Variant | vs | Score | Read |
+|---|---|---|---|
+| `rfp-40` (`RFP_MARGIN = 40`) | v1.4 | 61.7% | promising, only 1.5 SE — did not replicate (below) |
+| `rfp-120` | v1.4 | 20.0% | clearly much worse, 3.9 SE below even |
+| `rfp-40` re-test | v1.7 | 52.5% | within noise; the earlier 61.7% did not survive a cleaner baseline |
+| `lmp-tight` | v1.4 | 55.0% | no information |
+| `lmp-loose` | v1.4 | 48.3% | null |
+| `lmr-aggr` / `lmr-shy` | v1.4 | 50.0% / 48.3% | null |
+| `see-60` / `see-200` | v1.4 | 48.3% / 43.3% | both worse, confirms -110 is near optimal |
 
-LMR and LMP are insensitive, which together with an effective branching factor
-of 1.1-4.5 says pruning is otherwise exhausted. The sweep was stopped after
-eight of twelve variants; `delta-100`, `delta-350`, `fut-tight` and `fut-loose`
-were never run.
+`RFP_MARGIN` stays at 75. The one apparently-sensitive result found did not
+replicate against a cleaner baseline — a reminder that a result against a stale
+baseline is not evidence against a current one. LMR and LMP are insensitive,
+which together with an effective branching factor of 1.1-4.5 says pruning is
+otherwise close to exhausted. `delta-100`, `delta-350`, `fut-tight` and
+`fut-loose` were built but never arena-run; not pursued further this session
+given the effect sizes involved are likely below the measurement floor anyway
+(see "Not doing further" below).
 
 ### Bugs found in rated games, all fixed
 
@@ -242,11 +304,10 @@ Each was found by reading the per-game stderr log, which is why `DEBUG` stays on
   increment, finishing with 3.6 s left. `LOW_CLOCK_MS` now caps the budget below
   the increment when short, so the clock recovers.
 
-### Self-audit findings, this session (v1.6)
+### Bugs found by structural self-audit, not a rated-game loss (v1.6)
 
 A pass tracing every pruning/ordering mechanism's shared state, done before
-more tuning rather than after another rated-game loss, found two real bugs and
-one measurement gap:
+more tuning rather than after another loss:
 
 - The TT probe compared a cached entry's depth against the pre-extension depth
   while the store used the post-extension depth, so an in-check node could
@@ -256,23 +317,10 @@ one measurement gap:
   computing the extension before the probe.
 - `qsearch` had no draw detection. Verified with a hand-built stalemate
   (`k7/8/1Q6/8/8/8/8/7K b - - 0 1`): scored −1009 before the fix, 0 after.
-- **The arena harness's default clock (10s+0.1s) is a different regime than
-  rated games.** A self-play game caps at depth 3-4 on the fast clock but
-  reaches depth 6-8 on the realistic clock (120s+0.5s), matching this file's
-  own rated-game profile. Every pruning-constant sweep on record (RFP, LMP,
-  LMR, SEE) was measured in the shallow regime. Adopt a two-tier protocol from
-  here on: fast clock for screening, but **re-confirm any winner at
-  `--base-ms 120000 --increment-ms 500` before it ships.**
 - Futility pruning's gate is a strict superset of LMP's with no move-index
   limit, so wherever both are enabled `LMP_COUNT` cannot fire — a likely
-  explanation for the `lmp-tight`/`lmp-loose` null result below. Not yet
-  confirmed; needs a futility-disabled diagnostic arena to isolate.
-
-`baselines/philbert-v16/` freezes these two fixes. Not yet arena-confirmed at
-40 games — only a 12-game fast-clock smoke test (50.0%, no crashes or illegal
-moves). Every sweep below `philbert-v14` predates this baseline; treat
-`philbert-v16` as the control for anything measured from here on.
-  the increment when short, so the clock recovers.
+  explanation for the `lmp-tight`/`lmp-loose` null result above. Not yet
+  isolated; would need a futility-disabled diagnostic arena to confirm.
 
 ### Where the strength actually goes
 
@@ -282,144 +330,118 @@ moves). Every sweep below `philbert-v14` predates this baseline; treat
   correctly at depth 6** and it is a regression case in the suite.
 - **Round 49** contained no move losing 150cp. It lost through a run of 50-110cp
   second-best moves. That is the profile of being outplayed, not of a bug.
-- **Round 62** (v1.8, still current): `f5` looks merely bad through a complete
-  depth-7 search (-781) but walks into a forced mate a fresh depth-7 search of
-  the position *after* `f5` finds immediately (-29991, via `analysis.blunders`
-  scoring played vs best the same way). `Rd3+` holds a clearly losing but
-  non-forced position (-1083) instead. Forcing `search_root` a full
-  uninterrupted 30s directly (far more than any realistic per-move budget)
-  does find the mate, but only partway into depth 8, timing out mid-search on
-  `f5` itself before ever reaching an alternative to compare it against. Same
-  failure family as round 46 (missed below depth 9) — supports doing the
-  recapture/threat extensions item before anything else in "After that" below,
-  rather than a one-off patch. Regression case in the suite.
+- **Round 62** (v1.8, still current as of v1.9): `f5` looks merely bad through a
+  complete depth-7 search (-781) but walks into a forced mate a fresh depth-7
+  search of the position *after* `f5` finds immediately (-29991, via
+  `analysis.blunders` scoring played vs best the same way). `Rd3+` holds a
+  clearly losing but non-forced position (-1083) instead. Forcing `search_root`
+  a full uninterrupted 30s directly (far more than any realistic per-move
+  budget) does find the mate, but only partway into depth 8, timing out
+  mid-search on `f5` itself before ever reaching an alternative to compare it
+  against. Same failure family as round 46 (missed below depth 9). The
+  forced-reply extension measurably deepens the critical junction in this exact
+  line (after `Nxf5+` the king has exactly one legal reply, seldepth 14->21)
+  but is not enough alone to flip the result — the actual refutation needs more
+  than one extra ply there. Regression case in the suite.
 
 ### Measured profile
 
-Nodes per second 9-11k. Depth 6-8 in a rated game. `evaluate` is ~42% of
-runtime, `chess.polyglot.zobrist_hash` ~8%, quiescence ~66% of nodes. Effective
-branching factor 3.5-4.5 early, lower deeper — below the sqrt(35) that perfect
-ordering approaches, so **move ordering is not the bottleneck; nodes per second
-is.** Every debug line reports `ebf`, so rated games measure this for free.
+Nodes per second was 9-11k before this session's jits; roughly 15-25k after,
+position-dependent (mobility jitting helps piece-dense positions more than
+sparse ones with long-range sliding pieces — see the numba paragraph below).
+Depth 6-8 in a rated game, measured before the speedup; not yet re-measured at
+the new NPS. Effective branching factor 3.5-4.5 early, lower deeper — below the
+sqrt(35) that perfect ordering approaches, so **move ordering is close to its
+ceiling**. Every debug line reports `ebf`, so rated games measure this for
+free.
+
+**Numba jitting is real but not a clean multiplier for mobility.** Material/PST
+was a clean ~2x. Mobility/king-zone, verified bit-exact across 4012 positions,
+measured 7-10% faster on a sparse king+rook endgame, a wash on a busy
+middlegame, and *slower* than the pre-jit version on one open position with a
+queen on unobstructed diagonals and files — a queen ray-casts both diagonally
+and orthogonally, and simple ray-casting (chosen over magic bitboards for lower
+implementation risk) has no answer for "many empty squares to walk" the way a
+lookup table does. Kept anyway, since bit-exactness means the only thing it can
+affect is speed, never move choice at a given depth.
 
 ---
 
 ## Open work, in priority order
 
-1. **numba on `evaluate`.** A spike measured: current eval 32.87us, numba call
-   1.65us, extracting bitboards from `chess.Board` **4.01us**, full round trip
-   5.82us, JIT compile 1.94s which the init budget absorbs. Argument extraction
-   is the floor and caps the speedup at roughly 8x, not the 15-25x sometimes
-   claimed. Realistic: ~4x on eval, ~+45% nps. Split the work: material, PST and
-   pawn structure need no attack generation and are low risk; mobility and king
-   safety need sliding attacks reimplemented inside numba, which is where the
-   bugs would live. Measure after the first half.
-2. **Recapture and threat extensions.** Cheap, and target the round 46 failure.
-3. **Singular extensions.** Present in the 5x5 engine, never ported. Contested —
-   they may only pay from depth 10. One arena settles it.
-4. **Incremental Zobrist.** Only ~8% now, but grows once eval is jitted. Highest
-   risk of silent corruption; needs a debug mode that recomputes and asserts.
-5. **ProbCut.** Last. It is forward pruning: it makes the search see *less*, so
-   it does not fix a horizon problem, whatever it may do for speed.
+Anything here that claims a strength gain has to survive a 40 game arena
+against the current frozen baseline before it ships (or, for a change provably
+unable to alter node visitation — see "How changes get decided" — a bit-exact
+or debug-assert-verified correctness proof can substitute). Screen at the
+arena's default fast clock; **re-confirm any winner at realistic clock**
+(`--base-ms 120000 --increment-ms 500`) before it ships.
 
-Not worth doing: an NNUE-style evaluation makes a 10k nps engine slower and costs
-the ply it is meant to buy. Ordering-focused work, including history rework, has
-little headroom left given the measured branching factor.
+1. **Recapture and threat extensions.** Cheap, and aimed at the round 46/62
+   failure mode more directly than the forced-reply extension already shipped
+   (which helps only when a node narrows to exactly one legal reply).
+2. **Measure whether the forced-reply extension is a net positive** across
+   ordinary games, not just the two adversarial cases that motivated it. It's
+   verified sound and triggers correctly; strength effect is genuinely unknown.
+3. **A smarter sliding-attack representation for the mobility jit** (magic
+   bitboards, or the o^(o-2r) trick) — only worth it if the open-position
+   slowdown documented above turns out to matter in practice; simple
+   ray-casting was the deliberate lower-risk choice the first time.
+4. **Singular extensions.** Present in the 5x5 engine, never ported. Contested
+   — they may only pay from depth 10. One arena settles it.
+5. **Unconfound LMP from futility.** Build a diagnostic-only variant with
+   `FUTILITY_MARGIN` set unreachably high, then sweep `LMP_COUNT` tight/loose
+   against *that*, never against a real baseline. If a real gradient appears
+   where none did before, `LMP_COUNT` has genuine signal that was masked; if
+   still null, the existing conclusion stands on firmer ground. Never ship the
+   futility-disabled variant itself.
+6. **Finish the interrupted delta/futility sweep** (`delta-100`, `delta-350`,
+   `fut-tight`, `fut-loose` — built via `analysis.tune --all`, never arena-run).
+   Low expected value: `DELTA_MARGIN` and `QS_SEE_THRESHOLD=-110` prune
+   overlapping bad-capture populations, so a null result wouldn't mean delta
+   pruning is inert, just masked the same way LMP was.
+7. **Sweep NMP's `R` formula** (`reduction = 2 + depth // 6`, never tuned).
+   Same shadowing caveat as above: RFP returns before NMP is even reached under
+   the same guard, so a null result may mean RFP is shadowing NMP, not that `R`
+   doesn't matter.
+8. **Fix and re-enable aspiration windows.** Two defects first: the re-search
+   loop never checks the clock, and `search_root` accepts a fail-low's move
+   even though it's only an upper bound.
+9. **TT as typed arrays** (parallel numpy arrays instead of a list of tuples)
+   instead of the current Python-object TT. Unexplored; bounded; doesn't touch
+   move semantics or eval correctness, so lower risk than most speed work left.
 
-`docs/ENGINE_BRIEF.md` is a standalone version of this for outside review.
-
----
-
-## TODO
-
-Ordered by expected value. Anything here that claims a gain has to survive a
-40 game arena against the current frozen baseline before it ships.
-
-### Next
-
-All arenas below run against `baselines/philbert-v17`, not `v14` — see the
-self-audit note above. Screen at the arena's default fast clock; **re-confirm
-any winner at `--base-ms 120000 --increment-ms 500`** before it ships, since
-the fast clock and the realistic clock are now known to reach different
-depths.
-
-- [x] **Confirm `RFP_MARGIN = 40`** — done, did not confirm. 52.5% over 40
-      games against `v17` (+18 =6 -16), within noise. The earlier 61.7%/30
-      games was measured against a much older baseline before both the
-      TT/qsearch fixes and the staged-move-gen change; whatever signal that
-      had did not survive. `RFP_MARGIN` stays at 75. Not worth pursuing 20/55
-      further given this.
-- [ ] **Finish the interrupted sweep**: `delta-100`, `delta-350`, `fut-tight`,
-      `fut-loose` were never run. `uv run python -m analysis.tune --all` then
-      arena each. Note before concluding anything: `DELTA_MARGIN` and
-      `QS_SEE_THRESHOLD=-110` prune overlapping bad-capture populations, so a
-      null result for delta doesn't mean delta pruning is inert.
-- [ ] **New: sweep NMP's `R` formula.** `agent.py`'s `reduction = 2 + depth // 6`
-      has never been tuned. Try a fixed-step alternative closer to reference
-      engines at shallow depth (e.g. `R = 2 + (3 if depth >= 6 else 2)`). Same
-      caveat as delta/SEE: RFP returns before NMP is even reached under the
-      same guard, so a null result may mean RFP is shadowing NMP, not that `R`
-      doesn't matter.
-- [ ] **New: unconfound LMP from futility** (self-audit finding above). Build a
-      diagnostic-only variant with `FUTILITY_MARGIN` set unreachably high, then
-      sweep `LMP_COUNT` tight/loose against *that*, not `v17`. If a real
-      gradient appears where none did before, `LMP_COUNT` has genuine signal
-      that was masked; if still null, the existing conclusion stands on firmer
-      ground. Never ship the futility-disabled variant itself.
-
-**Done, inconclusive:** staged TT-move-first search shipped as v1.7. Turned
-out not to be the free win it looked like — skipping move generation after an
-early TT-move cutoff changes which sub-nodes get cached, and that can shift a
-cold-TT score by tens of centipawns through LMR/NMP/futility's approximate
-behavior, so it needed the same arena treatment as everything else. 43.8% over
-40 games against v16, within noise; kept rather than reverted since there
-were no correctness defects.
-
-- [x] **numba on `evaluate`, first half only** — done, shipped as v1.8. Jitted
-      material/PST/bishop pair only; mobility/king safety stay pure Python, as
-      planned. 3000-position parity check against the old loop: zero
-      mismatches. Self-play NPS ~24k, up from the 9-11k baseline (also
-      reflects v1.7's staged-move-gen). Fast-clock arena vs v17 was noise
-      (51.2%/40 games), which is expected — the fast clock caps depth at 3-4,
-      where an NPS gain is least likely to convert into a full extra ply.
-      Realistic-clock confirmation is the real test; see the result once it's
-      in. Mobility/king-safety jitting (needs sliding attacks reimplemented in
-      numba) is still open and still the highest-risk half.
-
-### After that
-
-- [ ] **Recapture and threat extensions.** Cheap, and aimed at the round 46
-      failure mode.
-- [ ] **Singular extensions.** Present in the 5x5 engine, never ported.
-      Contested; they may only pay from depth 10. One arena settles it.
-- [ ] **Fix and re-enable aspiration windows.** Two defects to repair first: the
-      re-search loop never checks the clock, and `search_root` accepts the move
-      returned by a fail low even though it is only an upper bound. Currently
-      off via `ASPIRATION_MIN_DEPTH = 999`.
-- [ ] **Incremental Zobrist.** Only ~8% now but grows once eval is jitted.
-      Needs a debug mode that recomputes and asserts, or it corrupts the
-      transposition table silently.
-
-### Ongoing
-
-- [ ] **Grow the scenario suite.** `kingsafety` has 2 positions and `endgame` 3.
-      Add a line to `analysis/positions.epd` after every rated game that shows a
-      weakness. Two suite expectations are unverified and may be wrong rather
-      than the engine: `take the opposition` prefers `e4` at +160 over `Ke2`,
-      and needs checking against a real endgame reference.
-- [ ] **Freeze a new baseline whenever a version ships**, so the next change is
-      measured against what it would actually replace.
-- [ ] **Read the per-game stderr log after every rated loss.** All three engine
-      bugs so far were found that way, not by local play.
-
-### Explicitly not doing
+**Not doing further, and why:**
 
 - **ProbCut.** Forward pruning makes the search see less, so it cannot fix a
-  horizon problem. Last resort only, and only with full-search verification.
-- **NNUE-style evaluation.** A more expensive eval at 10k nps costs the ply it
+  horizon problem — the opposite of what rounds 46 and 62 need.
+- **NNUE-style evaluation.** A more expensive eval at this nps costs the ply it
   is meant to buy.
-- **History and move-ordering rework.** The measured branching factor says
-  there is little headroom left.
+- **History and move-ordering rework**, and **more RFP/LMR/NMP constant
+  sweeps** beyond what's listed above. The measured branching factor says there
+  is little headroom left in ordering/pruning generally; every sweep this
+  project has run backs that up.
+- **A parallel hand-rolled engine state (integer moves, incrementally
+  maintained material/PST, a shadow board synced with `chess.Board`) to get
+  past `python-chess`'s own overhead.** This is the same incremental-eval path
+  already tried once in spirit and rejected in favor of numba (see "Lazy
+  evaluation on its own" above) — comparable theoretical payoff, much higher
+  correctness risk (state that must stay synchronized across every move type:
+  captures, castling, en passant, promotion), undertaken with less time to find
+  a bug in it than the pieces of incremental state already shipped needed. Not
+  worth the risk this close to a deadline; revisit only with real time to
+  spare and no live tournament clock running.
+
+**Ongoing, not a single item:**
+
+- **Grow the scenario suite.** `kingsafety` and `endgame` are the thinnest
+  themes. Add a line to `analysis/positions.epd` after every rated game that
+  shows a weakness. One suite expectation is still unverified and may be wrong
+  rather than the engine: `take the opposition` prefers `e4` over `Ke2`, and
+  needs checking against a real endgame reference.
+- **Freeze a new baseline whenever a version ships**, so the next change is
+  measured against what it would actually replace.
+- **Read the per-game stderr log after every rated loss.** Every engine bug
+  found so far was found that way, not by local play.
 
 ---
 
@@ -436,3 +458,7 @@ result is worth writing down; it stops the same experiment being repeated.
 Commit as soon as the gate passes rather than batching behind a long arena run.
 An editor once silently reverted `agent.py` to HEAD mid-session and an hour of
 uncommitted work survived only because copies happened to exist in a scratchpad.
+
+`docs/ENGINE_BRIEF.md` is a standalone version of this file's architecture and
+findings sections, written for outside review. Keep it in sync when either
+changes materially.
