@@ -30,3 +30,15 @@ r3kb1r/pp1b1ppp/4p3/3pP3/P2N1P2/3Q4/1qPBK1PP/R6R b kq - 3 15 ; id "r46: Bc5 lose
 # better tuned search should fix them.
 4b1k1/p1n2p2/1p3Ppr/1Pr1P3/2BR1K1p/N6P/8/6R1 w - - 7 49 ; id "r49 m49: Rg5 drops the bishop" ; theme regression ; am Rg5
 6k1/p2b1p2/1p2nPpr/1P2P1R1/2R3Kp/N6P/8/8 w - - 3 52 ; id "r49 m52: Nc2 drifts" ; theme regression ; am Nc2
+# Round 62 move 37 (v1.8, still reproduces). f5 looks merely bad through a
+# complete depth-7 search (-781) but walks into a forced mate a fresh depth-7
+# search of the position AFTER f5 finds immediately (-29991, confirmed via
+# analysis.blunders). Rd3+ holds a clearly losing but non-forced position
+# (-1083) instead. Forcing search_root a full uninterrupted 30s directly (no
+# realistic per-move budget would give it that much) finds the mate too, but
+# only partway into depth 8 before timing out mid-search on f5 itself, never
+# reaching an alternative to compare it against - a genuine, currently
+# unfixed horizon gap, not something today's TT/qsearch/numba changes touch.
+# Same failure family as r46 (missed at depth <9); candidate fix is the
+# still-open recapture/threat extensions item, not a quick patch here.
+7R/5pk1/1p5R/4p3/r2rBn2/5KN1/PP3P2/8 b - - 11 37 ; id "r62: f5 walks into mate, play Rd3+" ; theme regression ; am f5

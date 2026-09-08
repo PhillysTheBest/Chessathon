@@ -24,8 +24,23 @@ Playing and measuring:
 ```bash
 uv run python -m harness.play --white . --black baselines/philbert-v15 --pgn game.pgn
 uv run python -m harness.arena --agent . --opponent baselines/philbert-v15 --games 40
+uv run python -m harness.arena --agent . --opponent baselines/philbert-v15 --games 40 --sprt
 uv run python -m harness.play --fen "<fen>"     # rated games start off-book, so test off-book
 ```
+
+`--sprt` stops an arena early once the result is decisively one-sided (a Wald
+SPRT approximation), instead of always playing every game; `--games` is still
+the hard cap. Bounds default to `elo0=0, elo1=40`, sized for OUR sample sizes
+(the arena's own noise floor at n=40 is roughly +/-55 elo) rather than the
+tiny elo0=0/elo1=5 bounds big engine-testing projects use with thousands of
+games. Use it to screen — a clearly bad change (~20% score, like `rfp-120`'s
+historical 20.0%) resolves in ~25 games instead of running the full count,
+and a clearly great one (~75%, like the SEE threshold's 76.2%) resolves
+around 70-80. **A genuine toss-up correctly refuses to resolve early and runs
+to the `--games` cap** — that's by design, not a bug: forcing a call on a
+real coin flip would be worse than the noise it's meant to filter out. Off by
+default; every existing recorded command above keeps its exact fixed-N
+behavior.
 
 `agent.py` has a self-test. **The second argument is the whole remaining clock,
 not think time** — passing 8000 budgets about 600ms and reaches only depth 4,
@@ -267,6 +282,17 @@ moves). Every sweep below `philbert-v14` predates this baseline; treat
   correctly at depth 6** and it is a regression case in the suite.
 - **Round 49** contained no move losing 150cp. It lost through a run of 50-110cp
   second-best moves. That is the profile of being outplayed, not of a bug.
+- **Round 62** (v1.8, still current): `f5` looks merely bad through a complete
+  depth-7 search (-781) but walks into a forced mate a fresh depth-7 search of
+  the position *after* `f5` finds immediately (-29991, via `analysis.blunders`
+  scoring played vs best the same way). `Rd3+` holds a clearly losing but
+  non-forced position (-1083) instead. Forcing `search_root` a full
+  uninterrupted 30s directly (far more than any realistic per-move budget)
+  does find the mate, but only partway into depth 8, timing out mid-search on
+  `f5` itself before ever reaching an alternative to compare it against. Same
+  failure family as round 46 (missed below depth 9) — supports doing the
+  recapture/threat extensions item before anything else in "After that" below,
+  rather than a one-off patch. Regression case in the suite.
 
 ### Measured profile
 
