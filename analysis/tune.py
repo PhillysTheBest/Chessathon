@@ -48,6 +48,11 @@ VARIANTS: dict[str, tuple[str, str]] = {
     # and not one lucky sample.
     "see-60":      (r"^QS_SEE_THRESHOLD = .*", "QS_SEE_THRESHOLD = -60"),
     "see-200":     (r"^QS_SEE_THRESHOLD = .*", "QS_SEE_THRESHOLD = -200"),
+
+    # Bounded gravity history update + malus, replacing the flat unbounded
+    # `+= depth * depth` accumulate. See HISTORY_AGING_ENABLED's own comment.
+    "history-aging": (r"^HISTORY_AGING_ENABLED = .*",
+                       "HISTORY_AGING_ENABLED = True"),
 }
 
 

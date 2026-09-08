@@ -396,6 +396,30 @@ HISTORY = [[[0] * 64 for _ in range(64)] for _ in range(7)]
 KILLERS = [[0, 0] for _ in range(MAX_PLY)]
 COUNTER = [[0] * 64 for _ in range(64)]
 
+# History aging, EXPERIMENTAL. Off by default - the shipped behavior is the
+# flat, unbounded `+= depth * depth` at HISTORY's two update sites in
+# negamax. When on, a cutoff-causing quiet move gets a bounded gravity bonus
+# instead, and every OTHER quiet move already tried at that node before the
+# cutoff gets a matching malus - the malus is what gives the scheme its
+# "aging" property (a move that stops getting reinforced fades because other
+# moves' mali pull it down, not just because its own growth is capped).
+# Search a commit message near this comment for the arena result this was
+# tested with before deciding whether it stays on.
+HISTORY_AGING_ENABLED = False
+HISTORY_MAX = 16384
+
+
+def _history_bonus(depth):
+    return min(depth * depth, HISTORY_MAX)
+
+
+def _history_update(container, index, bonus):
+    """Bounded gravity update: container[index] moves toward +/-HISTORY_MAX
+    by `bonus`, rather than accumulating without bound. `bonus` may be
+    negative (a malus)."""
+    h = container[index]
+    container[index] = h + bonus - h * abs(bonus) // HISTORY_MAX
+
 # Late move reduction table, indexed [depth][move_index].
 LMR = [[0] * 64 for _ in range(64)]
 for _d in range(1, 64):
@@ -1627,6 +1651,10 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
     # try it before paying for the full list.
     tt_move_legal = tt_move is not None and board.is_legal(tt_move)
     cutoff = False
+    # Quiet moves tried at this node so far, for HISTORY_AGING_ENABLED's
+    # malus: only ever appended to (or read back) when that flag is on, so
+    # it costs nothing beyond an empty list when it's off.
+    tried_quiets: list[tuple[int, int, int]] = []
 
     SEARCH.path.append(key)
     try:
@@ -1664,8 +1692,17 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                             COUNTER[prev_move.from_square][
                                 prev_move.to_square] = packed
                         if piece_type:
-                            HISTORY[piece_type][move.from_square][
-                                move.to_square] += depth * depth
+                            if HISTORY_AGING_ENABLED:
+                                _history_update(
+                                    HISTORY[piece_type][move.from_square],
+                                    move.to_square, _history_bonus(depth))
+                            else:
+                                HISTORY[piece_type][move.from_square][
+                                    move.to_square] += depth * depth
+            if not cutoff and HISTORY_AGING_ENABLED and is_quiet and piece_type:
+                # Tried, didn't cut off: a malus candidate if a later move in
+                # the main loop below does.
+                tried_quiets.append((piece_type, move.from_square, move.to_square))
 
         if not cutoff:
             moves = list(board.legal_moves)
@@ -1768,9 +1805,23 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                                     COUNTER[prev_move.from_square][
                                         prev_move.to_square] = packed
                                 if piece_type:
-                                    HISTORY[piece_type][move.from_square][
-                                        move.to_square] += depth * depth
+                                    if HISTORY_AGING_ENABLED:
+                                        bonus = _history_bonus(depth)
+                                        _history_update(
+                                            HISTORY[piece_type][move.from_square],
+                                            move.to_square, bonus)
+                                        malus = -bonus
+                                        for m_pt, m_from, m_to in tried_quiets:
+                                            _history_update(
+                                                HISTORY[m_pt][m_from], m_to, malus)
+                                    else:
+                                        HISTORY[piece_type][move.from_square][
+                                            move.to_square] += depth * depth
                             break
+                if HISTORY_AGING_ENABLED and is_quiet and piece_type:
+                    # Tried, didn't cut off this node: a malus candidate if a
+                    # later move does.
+                    tried_quiets.append((piece_type, move.from_square, move.to_square))
     finally:
         SEARCH.path.pop()
 
