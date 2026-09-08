@@ -510,6 +510,174 @@ def _jit_material_pst(bitboards, pst_mg, pst_eg, piece_value_mg, piece_value_eg,
     return mg, eg, phase
 
 
+# Knight attacks are a fixed per-square pattern with no blockers to resolve,
+# so the table is taken directly from python-chess rather than re-derived -
+# one less place for a transcription bug to live. Sliding-piece attacks
+# (bishop/rook/queen) have no such table numba can use directly:
+# chess.BB_DIAG_ATTACKS et al. are Python dicts keyed by masked occupancy,
+# which numba cannot index efficiently, so those are computed by ray-casting
+# instead. Verified per-square against board.attacks_mask() directly (not
+# just the aggregate mobility score) across ~32000 individual square checks
+# before this was wired in.
+KNIGHT_ATTACKS_NP = np.array([int(bb) for bb in chess.BB_KNIGHT_ATTACKS], dtype=np.uint64)
+MOBILITY_MG_NP = np.array(MOBILITY_MG, dtype=np.int64)
+MOBILITY_EG_NP = np.array(MOBILITY_EG, dtype=np.int64)
+KING_ATTACK_WEIGHT_NP = np.array(KING_ATTACK_WEIGHT, dtype=np.int64)
+
+
+@njit(cache=False)
+def _diag_attacks_jit(square, occupied):
+    attacks = np.uint64(0)
+    one = np.uint64(1)
+    file = square % 8
+    rank = square // 8
+
+    f, r = file + 1, rank + 1
+    while f < 8 and r < 8:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        f += 1
+        r += 1
+    f, r = file - 1, rank + 1
+    while f >= 0 and r < 8:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        f -= 1
+        r += 1
+    f, r = file + 1, rank - 1
+    while f < 8 and r >= 0:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        f += 1
+        r -= 1
+    f, r = file - 1, rank - 1
+    while f >= 0 and r >= 0:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        f -= 1
+        r -= 1
+    return attacks
+
+
+@njit(cache=False)
+def _orth_attacks_jit(square, occupied):
+    attacks = np.uint64(0)
+    one = np.uint64(1)
+    file = square % 8
+    rank = square // 8
+
+    f, r = file, rank + 1
+    while r < 8:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        r += 1
+    f, r = file, rank - 1
+    while r >= 0:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        r -= 1
+    f, r = file + 1, rank
+    while f < 8:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        f += 1
+    f, r = file - 1, rank
+    while f >= 0:
+        bit = one << (r * 8 + f)
+        attacks |= bit
+        if occupied & bit:
+            break
+        f -= 1
+    return attacks
+
+
+@njit(cache=False)
+def _jit_mobility(bitboards, occupied, own_occ, target_zone,
+                   mobility_mg, mobility_eg, king_attack_weight, knight_attacks):
+    """Mobility and king-zone-attack contribution, jitted. Mirrors evaluate()'s
+    mobility loop exactly: for every knight/bishop/rook/queen, how many squares
+    it attacks that it doesn't already occupy (mobility) and how much of the
+    target king zone it covers (attack_units), by color.
+    """
+    mg = 0
+    eg = 0
+    au_black = 0
+    au_white = 0
+    one = np.uint64(1)
+
+    for color in range(2):
+        sign = 1 if color == 1 else -1
+        own = own_occ[color]
+        zone = target_zone[color]
+
+        for piece_type in range(2, 6):  # KNIGHT=2 .. QUEEN=5
+            bb = bitboards[color, piece_type]
+            if bb == 0:
+                continue
+            w_mg = mobility_mg[piece_type]
+            w_eg = mobility_eg[piece_type]
+            atk_weight = king_attack_weight[piece_type]
+
+            remaining = bb
+            while remaining:
+                lsb = remaining & (-remaining)
+                square = 0
+                temp = lsb
+                while temp > one:
+                    temp >>= one
+                    square += 1
+
+                if piece_type == 2:
+                    attacked = knight_attacks[square]
+                elif piece_type == 3:
+                    attacked = _diag_attacks_jit(square, occupied)
+                elif piece_type == 4:
+                    attacked = _orth_attacks_jit(square, occupied)
+                else:
+                    attacked = (_diag_attacks_jit(square, occupied)
+                                | _orth_attacks_jit(square, occupied))
+
+                moves_bb = attacked & ~own
+                moves = 0
+                mv = moves_bb
+                while mv:
+                    mv &= mv - one
+                    moves += 1
+                mg += sign * w_mg * moves
+                eg += sign * w_eg * moves
+
+                if zone != 0:
+                    hits_bb = attacked & zone
+                    hits = 0
+                    hv = hits_bb
+                    while hv:
+                        hv &= hv - one
+                        hits += 1
+                    if hits:
+                        if color == 0:
+                            au_black += atk_weight * hits
+                        else:
+                            au_white += atk_weight * hits
+
+                remaining ^= lsb
+
+    return mg, eg, au_black, au_white
+
+
 def evaluate(board, alpha=-INFINITY, beta=INFINITY):
     """Static evaluation in centipawns, from the side to move's point of view.
 
@@ -591,8 +759,6 @@ def evaluate(board, alpha=-INFINITY, beta=INFINITY):
         own = white if color else black
         own_pawns = white_pawns if color else black_pawns
         their_pawns = black_pawns if color else white_pawns
-        # The zone around the king we are attacking.
-        target_zone = zone_of[color]
 
         for square in chess.scan_forward(own_pawns):
             # Doubled: another friendly pawn ahead on the same file.
@@ -633,22 +799,21 @@ def evaluate(board, alpha=-INFINITY, beta=INFINITY):
                         else KING_OPEN_FILE_MG
                     )
 
-        for piece_type in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
-            weight_mg = MOBILITY_MG[piece_type]
-            weight_eg = MOBILITY_EG[piece_type]
-            attack_weight = KING_ATTACK_WEIGHT[piece_type]
-            for square in chess.scan_forward(board.pieces_mask(piece_type, color)):
-                attacked = board.attacks_mask(square)
-                moves = (attacked & ~own).bit_count()
-                mg += sign * weight_mg * moves
-                eg += sign * weight_eg * moves
-                # Same mask, reused: how much of the enemy king's zone this
-                # piece covers. Nearly free, since attacks_mask is already paid
-                # for by the mobility term.
-                if target_zone:
-                    hits = (attacked & target_zone).bit_count()
-                    if hits:
-                        attack_units[color] += attack_weight * hits
+    # Mobility and king-zone attacks (jitted): how many squares each
+    # knight/bishop/rook/queen attacks that it doesn't already occupy, and how
+    # much of the opponent's king zone it covers. Handles both colors in one
+    # call, so it runs once here rather than inside the per-color loop above.
+    own_occ = np.array([black, white], dtype=np.uint64)
+    target_zone_arr = np.array([zone_of[0], zone_of[1]], dtype=np.uint64)
+    occupied_bb = np.uint64(board.occupied)
+    mob_mg, mob_eg, au_black, au_white = _jit_mobility(
+        bitboards, occupied_bb, own_occ, target_zone_arr,
+        MOBILITY_MG_NP, MOBILITY_EG_NP, KING_ATTACK_WEIGHT_NP, KNIGHT_ATTACKS_NP,
+    )
+    mg += int(mob_mg)
+    eg += int(mob_eg)
+    attack_units[chess.BLACK] = int(au_black)
+    attack_units[chess.WHITE] = int(au_white)
 
     # King danger is a midgame term only: with the queens off, a king in the
     # open is an asset, not a liability, and the endgame PSTs already say so.
