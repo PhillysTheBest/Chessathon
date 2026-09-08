@@ -58,7 +58,9 @@ Analysis tooling:
 ```bash
 uv run python -m analysis.suite --seconds 3 --verbose            # scenario suite
 uv run python -m analysis.suite --theme kingsafety
-uv run python -m analysis.blunders game.pgn --us "Istanbul's finest" --depth 6
+uv run python -m analysis.blunders game.pgn --us "Istanbul's finest"          # two-stage: cheap scan, then verify only suspicious moves
+uv run python -m analysis.blunders game.pgn --us "..." --from-move 17 --force-deep  # verify every move in a range regardless
+uv run python -m analysis.trace game.pgn --us "Istanbul's finest" --move 17 --candidates Bxe4,Bg4  # replay-faithful per-depth trace of one decision
 uv run python -m analysis.tune --list                            # A/B variant recipes
 uv run python -m analysis.tune --all                             # generate them
 ```
@@ -104,11 +106,14 @@ board itself, move generation, and legality all stay `python-chess`'s.
 
 `agent.py` is one file, laid out top to bottom as: tunables, piece values,
 piece-square tables, evaluation terms and precomputed masks, numba-jitted
-material/PST/mobility helpers, move-ordering tables, transposition table,
-search state, `evaluate`, move ordering, SEE, incremental-Zobrist helpers,
-`qsearch`, `negamax`, `_root_window` / `search_root`, `OpponentTracker`,
-`compute_budget`, `get_move`, a warm-up that runs at import, and a `__main__`
-self-test the platform never executes.
+material/PST/mobility helpers, move-ordering tables and packed-move encoding,
+transposition table (five parallel typed numpy arrays, not a list of
+tuples), search state, `evaluate`, move ordering, SEE (also numba-jitted),
+incremental-Zobrist and incremental-evaluation helpers, `qsearch`, `negamax`,
+`_root_window` / `search_root` (with an optional analysis-only trace
+callback, `None` at the real call site), `OpponentTracker`, `compute_budget`,
+`get_move`, a warm-up that runs at import, and a `__main__` self-test the
+platform never executes.
 
 **Search.** Negamax with alpha-beta and PVS, iterative deepening under a
 soft/hard time split that unwinds through a `TimeUp` exception. Transposition
