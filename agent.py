@@ -391,8 +391,10 @@ for _a in range(1, 7):
         MVV_LVA[_a][_v] = PIECE_VALUE_MG[_v] * 16 - PIECE_VALUE_MG[_a]
 
 HISTORY = [[[0] * 64 for _ in range(64)] for _ in range(7)]
-KILLERS = [[None, None] for _ in range(MAX_PLY)]
-COUNTER = [[None] * 64 for _ in range(64)]
+# Killers/counters store packed moves (see pack_move below), not chess.Move
+# objects: 0 means "none set" rather than a real move.
+KILLERS = [[0, 0] for _ in range(MAX_PLY)]
+COUNTER = [[0] * 64 for _ in range(64)]
 
 # Late move reduction table, indexed [depth][move_index].
 LMR = [[0] * 64 for _ in range(64)]
@@ -401,18 +403,47 @@ for _d in range(1, 64):
         LMR[_d][_i] = int(0.75 + math.log(_d) * math.log(_i) / 2.25)
 
 # =============================================================================
+# MOVE ENCODING
+# =============================================================================
+# A chess.Move packed into a plain int: from_square (6 bits) | to_square
+# (6 bits) << 6 | promotion (3 bits) << 12. 0 is reserved for "no move" - it
+# is never produced by a real move, since a1a1 (from == to == 0) can't be
+# legal, and the only other from==to==0 move, chess.Move.null(), is never
+# stored anywhere a packed value is read back from (killers, counters, the TT
+# move slot). Used so KILLERS/COUNTER/the TT can hold plain ints instead of
+# chess.Move objects.
+
+
+def pack_move(move: "chess.Move") -> int:
+    return move.from_square | (move.to_square << 6) | ((move.promotion or 0) << 12)
+
+
+def unpack_move(packed: int) -> "chess.Move":
+    from_square = packed & 0x3F
+    to_square = (packed >> 6) & 0x3F
+    promotion = (packed >> 12) & 0x7
+    return chess.Move(from_square, to_square, promotion or None)
+
+
+# =============================================================================
 # TRANSPOSITION TABLE
 # =============================================================================
-# Entries are (key, depth, score, flag, move), bucketed by key & TT_MASK and
-# replaced on depth. Same scheme as the 5x5 engine, sized for 8x8.
+# Parallel typed arrays rather than a list of (key, depth, score, flag, move)
+# tuples: array indexing and primitive dtypes at every probe/store, the hot
+# path's most frequent operation, instead of Python-tuple unpacking and
+# chess.Move objects. Bucketed by key & TT_MASK and replaced on depth, same
+# scheme as before. TT_DEPTH doubles as the occupancy flag: -1 marks an empty
+# bucket, since a real search depth is never negative.
 
-# (key, depth, score, flag, move) per bucket, or None when empty.
-TT: list[tuple[int, int, int, int, "chess.Move"] | None] = [None] * TT_SIZE
+TT_KEY = np.zeros(TT_SIZE, dtype=np.uint64)
+TT_DEPTH = np.full(TT_SIZE, -1, dtype=np.int16)
+TT_SCORE = np.zeros(TT_SIZE, dtype=np.int16)
+TT_FLAG = np.zeros(TT_SIZE, dtype=np.uint8)
+TT_MOVE = np.zeros(TT_SIZE, dtype=np.uint16)  # packed, see pack_move above
 
 
 def tt_clear():
-    for i in range(TT_SIZE):
-        TT[i] = None
+    TT_DEPTH.fill(-1)
 
 
 # =============================================================================
@@ -846,8 +877,8 @@ def order_moves(board, moves, tt_move, ply, prev_move):
     """TT move, then captures by MVV-LVA, then promotions, then killers, then
     the counter move, then history. Alpha-beta only pays when this is right."""
     them = board.occupied_co[not board.turn]
-    killer0, killer1 = KILLERS[ply] if ply < MAX_PLY else (None, None)
-    counter = None
+    killer0, killer1 = KILLERS[ply] if ply < MAX_PLY else (0, 0)
+    counter = 0
     if prev_move is not None:
         counter = COUNTER[prev_move.from_square][prev_move.to_square]
 
@@ -877,15 +908,17 @@ def order_moves(board, moves, tt_move, ply, prev_move):
                 score = 800_000_000 + MVV_LVA[attacker][victim]
         elif board.is_en_passant(move):
             score = 800_000_000 + MVV_LVA[chess.PAWN][chess.PAWN]
-        elif move == killer0:
-            score = 700_000_000
-        elif move == killer1:
-            score = 690_000_000
-        elif counter is not None and move == counter:
-            score = 680_000_000
         else:
-            piece_type = board.piece_type_at(move.from_square)
-            score = HISTORY[piece_type][move.from_square][to_square]
+            packed = pack_move(move)
+            if packed == killer0:
+                score = 700_000_000
+            elif packed == killer1:
+                score = 690_000_000
+            elif counter and packed == counter:
+                score = 680_000_000
+            else:
+                piece_type = board.piece_type_at(move.from_square)
+                score = HISTORY[piece_type][move.from_square][to_square]
 
         append((score, move))
 
@@ -1244,19 +1277,21 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
 
     # --- transposition probe ----------------------------------------------
     index = key & TT_MASK
-    entry = TT[index]
+    tt_depth = int(TT_DEPTH[index])
+    tt_hit = tt_depth >= 0 and int(TT_KEY[index]) == key
     tt_move = None
 
-    if entry is not None and entry[0] == key:
-        tt_move = entry[4]
-        if not is_pv and entry[1] >= depth and ply > 0:
-            score = entry[2]
+    if tt_hit:
+        packed_tt_move = int(TT_MOVE[index])
+        tt_move = unpack_move(packed_tt_move) if packed_tt_move else None
+        if not is_pv and tt_depth >= depth and ply > 0:
+            score = int(TT_SCORE[index])
             # Mate scores are stored relative to the root; re-anchor them.
             if score > MATE_BOUND:
                 score -= ply
             elif score < -MATE_BOUND:
                 score += ply
-            flag = entry[3]
+            flag = int(TT_FLAG[index])
             if flag == TT_EXACT:
                 return score
             if flag == TT_LOWER and score >= beta:
@@ -1298,9 +1333,11 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
     # --- internal iterative deepening -------------------------------------
     if tt_move is None and depth >= 4 and is_pv:
         negamax(board, depth - 2, alpha, beta, ply, prev_move, allow_null, key)
-        entry = TT[index]
-        if entry is not None and entry[0] == key:
-            tt_move = entry[4]
+        tt_depth = int(TT_DEPTH[index])
+        tt_hit = tt_depth >= 0 and int(TT_KEY[index]) == key
+        if tt_hit:
+            packed_tt_move = int(TT_MOVE[index])
+            tt_move = unpack_move(packed_tt_move) if packed_tt_move else None
 
     them = board.occupied_co[not board.turn]
     can_futility = (
@@ -1348,14 +1385,15 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 if alpha >= beta:
                     cutoff = True
                     if is_quiet:
+                        packed = pack_move(move)
                         if ply < MAX_PLY:
                             slot = KILLERS[ply]
-                            if slot[0] != move:
+                            if slot[0] != packed:
                                 slot[1] = slot[0]
-                                slot[0] = move
+                                slot[0] = packed
                         if prev_move is not None:
                             COUNTER[prev_move.from_square][
-                                prev_move.to_square] = move
+                                prev_move.to_square] = packed
                         if piece_type:
                             HISTORY[piece_type][move.from_square][
                                 move.to_square] += depth * depth
@@ -1441,14 +1479,15 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                             if is_quiet:
                                 # Killer, counter move and history updates,
                                 # lifted from the 5x5 engine's ordering scheme.
+                                packed = pack_move(move)
                                 if ply < MAX_PLY:
                                     slot = KILLERS[ply]
-                                    if slot[0] != move:
+                                    if slot[0] != packed:
                                         slot[1] = slot[0]
-                                        slot[0] = move
+                                        slot[0] = packed
                                 if prev_move is not None:
                                     COUNTER[prev_move.from_square][
-                                        prev_move.to_square] = move
+                                        prev_move.to_square] = packed
                                 if piece_type:
                                     HISTORY[piece_type][move.from_square][
                                         move.to_square] += depth * depth
@@ -1476,8 +1515,12 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
     elif stored < -MATE_BOUND:
         stored -= ply
 
-    if entry is None or entry[0] != key or depth >= entry[1]:
-        TT[index] = (key, depth, stored, flag, best_move)
+    if not tt_hit or depth >= tt_depth:
+        TT_KEY[index] = key
+        TT_DEPTH[index] = depth
+        TT_SCORE[index] = stored
+        TT_FLAG[index] = flag
+        TT_MOVE[index] = pack_move(best_move)
 
     return best_score
 
@@ -1688,10 +1731,13 @@ def _extract_pv(board, root_move, limit):
         if key in seen:
             break
         seen.add(key)
-        entry = TT[key & TT_MASK]
-        if entry is None or entry[0] != key or entry[4] is None:
+        index = key & TT_MASK
+        if TT_DEPTH[index] < 0 or int(TT_KEY[index]) != key:
             break
-        move = entry[4]
+        packed_move = int(TT_MOVE[index])
+        if packed_move == 0:
+            break
+        move = unpack_move(packed_move)
         if move not in scratch.legal_moves:
             break
         line.append(scratch.san(move))
@@ -1896,8 +1942,8 @@ def _warm_up():
     SEARCH.path = []
     SEARCH.nodes = 0
     for ply in range(MAX_PLY):
-        KILLERS[ply][0] = None
-        KILLERS[ply][1] = None
+        KILLERS[ply][0] = 0
+        KILLERS[ply][1] = 0
 
 
 _warm_up()
