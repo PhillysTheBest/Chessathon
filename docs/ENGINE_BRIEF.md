@@ -131,6 +131,7 @@ done.
 | v1.7 over v1.6 — staged TT-move-first search | inconclusive: 43.8% over 40 games, within noise; kept, not reverted (see §4) |
 | v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast-clock arena was noise (51.2%/40 games, expected at that clock); kept on the strength of a bit-exact correctness proof instead |
 | v1.9 over v1.8 — forced-reply extension, numba mobility/king-zone jit, incremental Zobrist | not arena-confirmed at all, individually or combined, given a tournament deadline; each verified to the strongest correctness standard available for its kind (see §4) |
+| `hybrid-engine-state` branch over v1.9 (unmerged) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed; each phase verified to a correctness standard instead (see §4). Built at explicit user request, overriding an earlier "not worth the risk" rejection of this architecture. |
 | Aspiration windows | −15.6% nodes to depth 8; **lost the arena, 42.5%, with one game lost by flagging** — rejected, still disabled |
 
 ---
@@ -182,6 +183,24 @@ magic bitboards for lower implementation risk) has no answer for "many empty
 squares to walk" the way a lookup table does. Kept anyway: proven bit-exact
 against the pure-Python version across 4012 positions, so the only thing it can
 affect is speed, never move choice at a given depth.
+
+**An assert-against-ground-truth debug flag caught a real bug on its first real
+test.** Incremental material/PST/phase evaluation (mirroring the incremental
+Zobrist key's shape: a delta computed before a push, threaded through
+negamax/qsearch as an optional argument, every non-threading call site still
+correct just slower) shipped with `EVAL_ASSERT`, a flag that recomputes pass 1
+from scratch and asserts it matches the incremental value on every call —
+exactly the pattern `ZOBRIST_ASSERT` already used. The very first assertion
+trip found a real bug: the en passant branch used the mover's sign instead of
+the captured pawn owner's sign, silently writing every en passant capture's
+material/PST swing in the wrong direction. Fixed, then re-verified clean
+across 800 random-walk games checked at every ply, a depth-3 exhaustive sweep
+over positions chosen for castling/promotion/bishop-pair coverage, and 4 full
+self-play games through checkmate and promotion. Because the incremental
+value is now proven *exactly* equal to a fresh recompute, not merely close,
+this was treated as the same class of change as the material/PST and
+mobility jits — provably unable to alter node visitation — rather than one
+needing an arena.
 
 **Two confident diagnoses from reading game logs were wrong when measured.** A
 king walking to g4 in a rook ending looked like a king-safety bug; measured, it

@@ -219,11 +219,57 @@ this was discovered was measured in the shallow regime only.
 | v1.7 over v1.6 — staged TT-move-first search | inconclusive: 43.8% over 40 games, within noise; kept, not reverted |
 | v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast-clock arena was noise (51.2%/40 games, expected at that clock); kept on a bit-exact correctness proof instead |
 | v1.9 over v1.8 — forced-reply extension, numba mobility/king-zone jit, incremental Zobrist | not arena-confirmed at all, given a tournament deadline; each verified to the strongest correctness standard available for its kind instead (bit-exact parity, debug-assert against `chess.polyglot.zobrist_hash`, or direct before/after comparison) |
+| `hybrid-engine-state` branch over v1.9 (unmerged) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed (see below); each phase verified to a correctness standard instead |
 
 `submission.zip` is rebuilt from the current tree, not from a version proven to
-beat the ladder — none of v1.7-v1.9 have arena confirmation, only correctness
-verification. Rebuild it (`uv run python -m harness.package`) and verify it
-runs standalone from a clean extract before treating it as ready to upload.
+beat the ladder — none of v1.7-v1.9, nor the `hybrid-engine-state` branch, have
+arena confirmation, only correctness verification. Rebuild it
+(`uv run python -m harness.package`) and verify it runs standalone from a clean
+extract before treating it as ready to upload.
+
+**The `hybrid-engine-state` branch, in more detail.** Built at the user's
+explicit request to override "Not doing further"'s rejection (below) of a
+hybrid engine-state architecture, given a live tournament deadline. Three
+phases landed, each independently verified rather than arena-tested:
+
+- **Packed-integer moves + typed-array TT** (Open Work #9 below, now done):
+  `KILLERS`/`COUNTER`/the TT's move slot hold a packed 15-bit int instead of a
+  `chess.Move` object; `TT` is five parallel numpy arrays instead of a list of
+  tuples. Verified with a fixed-depth parity harness (not committed): 20
+  positions at depth 5 from an empty TT, identical move/score/nodes/qnodes
+  before and after — a pure storage-layout change, node visitation unaffected.
+- **Numba-jitted SEE**: `see()` used `board.attackers_mask()`, not
+  numba-compatible; now jitted using the mobility jit's own ray-casting
+  helpers plus new `PAWN_ATTACKS_NP`/`KING_ATTACKS_NP` tables (from
+  python-chess's own `BB_PAWN_ATTACKS`/`BB_KING_ATTACKS`). Verified against
+  the pure-Python version it replaced across 91,683 legal captures (123 en
+  passant, 568 promotion) from the scenario suite plus 400 random-walk games:
+  0 mismatches.
+- **Incremental material/PST/phase evaluation**: `evaluate()`'s pass 1 no
+  longer recomputes from scratch on every call when an incremental
+  `mg_eg_phase` value is threaded through negamax/qsearch/`_root_window` (a
+  structural twin of the incremental-Zobrist machinery, extended with
+  material/phase/bishop-pair on top of the same piece-square delta shape).
+  `EVAL_ASSERT` (mirrors `ZOBRIST_ASSERT`) caught a real bug on the first real
+  test: the en passant branch used the mover's sign instead of the captured
+  pawn owner's sign. Fixed, then re-verified clean: a depth-3 exhaustive
+  sweep over 10 positions chosen for castling/promotion/bishop-pair-threshold
+  coverage, 800 random-walk games checked at every ply, the scenario suite at
+  depth 6, and 4 complete self-play games through checkmate/threefold/
+  promotion. Since the incremental value is proven *exactly* equal to a fresh
+  recompute rather than merely close, this is treated as the same class of
+  change as the material/PST and mobility jits (provably unable to alter node
+  visitation), not a behavior change needing the arena.
+
+A 10-game spot-check against `philbert-v19` (+4 =4 −2, 60%) found no crashes,
+illegal moves, or blunder pattern — not a strength claim at that sample size,
+just a sanity check. **Extending staged move generation to captures** (the
+essay's other recommendation, and the reason a "Phase D" was planned) was
+deliberately not attempted: unlike the three phases above, it changes *which*
+nodes get visited and cached — the same risk class the staged TT-move-first
+search (`v1.7`) turned out to belong to despite looking behavior-preserving —
+so a correctness proof cannot substitute for it, and it was not implemented
+without a real 30-40 game arena to back it.
 
 ### The single most important result
 
@@ -406,9 +452,15 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
 8. **Fix and re-enable aspiration windows.** Two defects first: the re-search
    loop never checks the clock, and `search_root` accepts a fail-low's move
    even though it's only an upper bound.
-9. **TT as typed arrays** (parallel numpy arrays instead of a list of tuples)
-   instead of the current Python-object TT. Unexplored; bounded; doesn't touch
-   move semantics or eval correctness, so lower risk than most speed work left.
+9. ~~TT as typed arrays~~ — done, see the `hybrid-engine-state` branch entry
+   above.
+10. **Extend staged move generation to captures** (`generate_legal_captures()`
+    searched before the full legal-move list is ever built, past the existing
+    TT-move-first stage). Sketched out on the `hybrid-engine-state` branch but
+    not implemented: unlike that branch's other three phases, this changes
+    *which* nodes get visited and cached — the same risk class `v1.7`'s
+    staged TT-move-first search turned out to belong to — so it needs a real
+    40-game arena, not a correctness proof, before it ships.
 
 **Not doing further, and why:**
 
@@ -420,16 +472,16 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
   sweeps** beyond what's listed above. The measured branching factor says there
   is little headroom left in ordering/pruning generally; every sweep this
   project has run backs that up.
-- **A parallel hand-rolled engine state (integer moves, incrementally
+- ~~A parallel hand-rolled engine state (integer moves, incrementally
   maintained material/PST, a shadow board synced with `chess.Board`) to get
-  past `python-chess`'s own overhead.** This is the same incremental-eval path
-  already tried once in spirit and rejected in favor of numba (see "Lazy
-  evaluation on its own" above) — comparable theoretical payoff, much higher
-  correctness risk (state that must stay synchronized across every move type:
-  captures, castling, en passant, promotion), undertaken with less time to find
-  a bug in it than the pieces of incremental state already shipped needed. Not
-  worth the risk this close to a deadline; revisit only with real time to
-  spare and no live tournament clock running.
+  past `python-chess`'s own overhead.~~ This rejection stood on its own
+  merits (comparable theoretical payoff to numba, much higher correctness
+  risk: state that must stay synchronized across every move type — captures,
+  castling, en passant, promotion), but was overridden at the user's explicit
+  request despite the live tournament clock; see the `hybrid-engine-state`
+  branch entry above for what shipped and how it was verified instead of
+  arena-tested. `chess.Board` stayed the sole legality/correctness oracle
+  throughout — nothing here reimplements movegen or legality.
 
 **Ongoing, not a single item:**
 
