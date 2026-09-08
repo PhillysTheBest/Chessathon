@@ -1102,6 +1102,16 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
                 return -MATE_SCORE + ply if in_check else 0
 
             moves = order_moves(board, moves, tt_move, ply, prev_move)
+            # Forced-reply extension: one legal move costs nothing extra to
+            # search one ply deeper, since there is nothing else at this node
+            # to spend that node budget on. Deliberately the strict len==1
+            # case only, not "a few" - that version risks over-extending
+            # zugzwang endgames where a side has 2-3 legal moves that are all
+            # bad, not forced. Targets the same failure family as rounds 46
+            # and 62 (a long forcing sequence the search was a ply too shallow
+            # to see through), which is exactly where a real forced reply
+            # (check evasions, escaping a mating net) shows up as this.
+            one_reply_ext = 1 if len(moves) == 1 else 0
 
             for move_index, move in enumerate(moves):
                 if tt_move_legal and move == tt_move:
@@ -1124,7 +1134,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
                 gives_check = board.is_check()
 
                 if searched == 0:
-                    score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move)
+                    score = -negamax(board, depth - 1 + one_reply_ext, -beta,
+                                     -alpha, ply + 1, move)
                 else:
                     reduction = 0
                     if is_quiet and depth >= 3 and not gives_check and move_index >= 3:
