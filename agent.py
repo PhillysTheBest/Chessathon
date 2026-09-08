@@ -465,6 +465,29 @@ class Searcher:
         self.path = []  # zobrist keys along the current search path
         self.game_keys = {}  # zobrist key -> times already played this game
 
+        # Move-ordering telemetry, DEBUG-only (see search_root's summary
+        # line). Purely additive counters at existing branch points - can't
+        # change move selection, only report on it. cutoff_at_index[i] counts
+        # beta cutoffs whose move was at ordered index i (3+ bucketed into
+        # slot 3); tt_move_cutoffs is the subset from the staged TT-move-first
+        # branch specifically, which never reaches the indexed loop at all.
+        self.cutoff_at_index = [0, 0, 0, 0]
+        self.tt_move_cutoffs = 0
+        self.total_cutoffs = 0
+        self.nmp_cutoffs = 0
+        self.nmp_tries = 0
+        self.lmr_full_researches = 0
+        self.lmr_reductions = 0
+
+    def reset_telemetry(self):
+        self.cutoff_at_index = [0, 0, 0, 0]
+        self.tt_move_cutoffs = 0
+        self.total_cutoffs = 0
+        self.nmp_cutoffs = 0
+        self.nmp_tries = 0
+        self.lmr_full_researches = 0
+        self.lmr_reductions = 0
+
     def check_time(self):
         # Only touch the clock every 1024 nodes; perf_counter is not free.
         if self.nodes & 1023 == 0 and time.perf_counter() >= self.hard_deadline:
@@ -1555,6 +1578,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             )
             if has_pieces:
                 reduction = 2 + depth // 6
+                SEARCH.nmp_tries += 1
                 board.push(chess.Move.null())
                 SEARCH.path.append(key)
                 try:
@@ -1568,6 +1592,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                     SEARCH.path.pop()
                     board.pop()
                 if score >= beta:
+                    SEARCH.nmp_cutoffs += 1
                     return beta if score > MATE_BOUND else score
 
     # --- internal iterative deepening -------------------------------------
@@ -1626,6 +1651,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 alpha = score
                 if alpha >= beta:
                     cutoff = True
+                    SEARCH.total_cutoffs += 1
+                    SEARCH.tt_move_cutoffs += 1
                     if is_quiet:
                         packed = pack_move(move)
                         if ply < MAX_PLY:
@@ -1702,10 +1729,13 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                                      mg_eg_phase=child_mg_eg_phase)
 
                     # The reduced search beat alpha, so redo it at full depth.
-                    if reduction > 0 and score > alpha:
-                        score = -negamax(board, depth - 1, -alpha - 1, -alpha,
-                                         ply + 1, move, key=child_key,
-                                         mg_eg_phase=child_mg_eg_phase)
+                    if reduction > 0:
+                        SEARCH.lmr_reductions += 1
+                        if score > alpha:
+                            SEARCH.lmr_full_researches += 1
+                            score = -negamax(board, depth - 1, -alpha - 1, -alpha,
+                                             ply + 1, move, key=child_key,
+                                             mg_eg_phase=child_mg_eg_phase)
 
                     # PVS re-search on a full window inside the bounds.
                     if alpha < score < beta:
@@ -1723,6 +1753,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                     if score > alpha:
                         alpha = score
                         if alpha >= beta:
+                            SEARCH.total_cutoffs += 1
+                            SEARCH.cutoff_at_index[min(move_index, 3)] += 1
                             if is_quiet:
                                 # Killer, counter move and history updates,
                                 # lifted from the 5x5 engine's ordering scheme.
@@ -1841,6 +1873,7 @@ def search_root(board, soft_s, hard_s):
     SEARCH.qnodes = 0
     SEARCH.seldepth = 0
     SEARCH.path = []
+    SEARCH.reset_telemetry()
 
     base_stack = len(board.move_stack)
 
@@ -1949,6 +1982,27 @@ def search_root(board, soft_s, hard_s):
         # extra ply costs roughly 2-3x the last one.
         if time.perf_counter() - start > budget * 0.5:
             break
+
+    if DEBUG:
+        total_cutoffs = SEARCH.total_cutoffs
+        if total_cutoffs:
+            idx_pct = [100.0 * c / total_cutoffs for c in SEARCH.cutoff_at_index]
+            tt_pct = 100.0 * SEARCH.tt_move_cutoffs / total_cutoffs
+        else:
+            idx_pct = [0.0, 0.0, 0.0, 0.0]
+            tt_pct = 0.0
+        nmp_pct = (100.0 * SEARCH.nmp_cutoffs / SEARCH.nmp_tries
+                   if SEARCH.nmp_tries else 0.0)
+        lmr_pct = (100.0 * SEARCH.lmr_full_researches / SEARCH.lmr_reductions
+                   if SEARCH.lmr_reductions else 0.0)
+        print(
+            f"  ordering: cutoffs tt {tt_pct:4.1f}% idx0 {idx_pct[0]:4.1f}% "
+            f"idx1 {idx_pct[1]:4.1f}% idx2 {idx_pct[2]:4.1f}% idx3+ {idx_pct[3]:4.1f}% "
+            f"| nmp {nmp_pct:4.1f}% ({SEARCH.nmp_cutoffs}/{SEARCH.nmp_tries}) "
+            f"| lmr re-search {lmr_pct:4.1f}% "
+            f"({SEARCH.lmr_full_researches}/{SEARCH.lmr_reductions})",
+            file=sys.stderr,
+        )
 
     return best_move, best_score, completed_depth, pv
 
