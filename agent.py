@@ -1009,6 +1009,103 @@ def see(board, move):
 
 
 # =============================================================================
+# INCREMENTAL ZOBRIST
+# =============================================================================
+# chess.polyglot.zobrist_hash recomputes the full board every call - ~8% of
+# runtime per the profile. The piece-square component is the part worth
+# updating incrementally (an O(pieces) loop collapsed to an O(1) XOR); the
+# castling and en-passant components are cheap fixed-cost checks already, so
+# those are recomputed via python-chess's own ZobristHasher methods before and
+# after each push rather than hand-derived, which is both simpler and removes
+# an entire class of risk (an early draft of the castling square mapping for
+# this got the rook-origin bit indices backwards against python-chess's own
+# square numbering - reusing the library's own logic for that part avoids
+# needing to get it right a second time by hand).
+#
+# key=None on negamax is the fallback: recompute from scratch, exactly as
+# before this existed. Every call site that does not thread an incremental
+# key through still gets a correct key, just not a faster one - there is no
+# path that produces a wrong key silently, only a slower-but-correct one.
+ZOBRIST_ASSERT = False  # debug only: recomputes and asserts on every push
+
+_ZOBRIST_HASHER = chess.polyglot.ZobristHasher(chess.polyglot.POLYGLOT_RANDOM_ARRAY)
+_ZOBRIST_TURN_KEY = chess.polyglot.POLYGLOT_RANDOM_ARRAY[780]
+
+# PIECE_SQUARE_KEY[pivot][piece_type][square], pivot = int(color) matching
+# enumerate(board.occupied_co) in chess.polyglot.ZobristHasher.hash_board
+# (0 = black, 1 = white) exactly, so no color-index adjustment is needed
+# anywhere this table is read.
+PIECE_SQUARE_KEY = [[[0] * 64 for _ in range(7)] for _ in range(2)]
+for _pivot in (0, 1):
+    for _piece_type in range(1, 7):
+        _piece_index = (_piece_type - 1) * 2 + _pivot
+        for _square in range(64):
+            PIECE_SQUARE_KEY[_pivot][_piece_type][_square] = (
+                chess.polyglot.POLYGLOT_RANDOM_ARRAY[64 * _piece_index + _square]
+            )
+
+
+def _piece_square_delta(board, move):
+    """XOR delta for the piece-square component of the hash, for `move` not
+    yet pushed onto `board`. Handles captures, en passant, castling's rook
+    move, and promotion. A null move (from_square == to_square) moves
+    nothing, by construction of chess.Move.null().
+    """
+    if move.from_square == move.to_square:
+        return 0
+
+    pivot = 1 if board.turn else 0
+    from_sq = move.from_square
+    to_sq = move.to_square
+    piece_type = board.piece_type_at(from_sq)
+
+    delta = PIECE_SQUARE_KEY[pivot][piece_type][from_sq]
+    delta ^= PIECE_SQUARE_KEY[pivot][move.promotion or piece_type][to_sq]
+
+    if board.is_en_passant(move):
+        captured_sq = to_sq + (-8 if board.turn else 8)
+        delta ^= PIECE_SQUARE_KEY[1 - pivot][chess.PAWN][captured_sq]
+    else:
+        captured_type = board.piece_type_at(to_sq)
+        if captured_type is not None:
+            delta ^= PIECE_SQUARE_KEY[1 - pivot][captured_type][to_sq]
+
+    if board.is_castling(move):
+        queenside = chess.square_file(to_sq) < chess.square_file(from_sq)
+        rank = chess.A1 if board.turn else chess.A8
+        rook_from = rank if queenside else rank + 7
+        rook_to = (rank + 3) if queenside else (rank + 5)
+        delta ^= PIECE_SQUARE_KEY[pivot][chess.ROOK][rook_from]
+        delta ^= PIECE_SQUARE_KEY[pivot][chess.ROOK][rook_to]
+
+    return delta
+
+
+def _zobrist_pre(board, move):
+    """Snapshot the state that must be read before `move` is pushed. Pair
+    with _zobrist_post after board.push(move)."""
+    return (
+        _piece_square_delta(board, move),
+        _ZOBRIST_HASHER.hash_castling(board) ^ _ZOBRIST_HASHER.hash_ep_square(board),
+    )
+
+
+def _zobrist_post(board, key, pre):
+    """Combine a _zobrist_pre snapshot with post-push state to get the
+    pushed position's key. Call immediately after board.push(move)."""
+    delta, old_extra = pre
+    new_extra = (
+        _ZOBRIST_HASHER.hash_castling(board) ^ _ZOBRIST_HASHER.hash_ep_square(board)
+    )
+    new_key = key ^ delta ^ old_extra ^ new_extra ^ _ZOBRIST_TURN_KEY
+    if ZOBRIST_ASSERT:
+        assert new_key == chess.polyglot.zobrist_hash(board), (
+            board.fen(), new_key, chess.polyglot.zobrist_hash(board)
+        )
+    return new_key
+
+
+# =============================================================================
 # QUIESCENCE
 # =============================================================================
 
@@ -1109,14 +1206,15 @@ RFP_MARGIN = 75
 LMP_COUNT = [0, 5, 8, 13, 20, 29, 40]
 
 
-def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
+def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None):
     SEARCH.nodes += 1
     SEARCH.check_time()
 
     is_pv = beta - alpha > 1
     original_alpha = alpha
 
-    key = chess.polyglot.zobrist_hash(board)
+    if key is None:
+        key = chess.polyglot.zobrist_hash(board)
 
     # --- draws -------------------------------------------------------------
     if ply > 0:
@@ -1199,7 +1297,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
 
     # --- internal iterative deepening -------------------------------------
     if tt_move is None and depth >= 4 and is_pv:
-        negamax(board, depth - 2, alpha, beta, ply, prev_move, allow_null)
+        negamax(board, depth - 2, alpha, beta, ply, prev_move, allow_null, key)
         entry = TT[index]
         if entry is not None and entry[0] == key:
             tt_move = entry[4]
@@ -1234,8 +1332,11 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
             is_capture = bool(chess.BB_SQUARES[move.to_square] & them)
             is_quiet = not is_capture and not move.promotion
 
+            zpre = _zobrist_pre(board, move)
             board.push(move)
-            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move)
+            child_key = _zobrist_post(board, key, zpre)
+            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move,
+                             key=child_key)
             piece_type = board.piece_type_at(move.to_square)
             board.pop()
             searched = 1
@@ -1295,12 +1396,14 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
                     if can_futility:
                         continue
 
+                zpre = _zobrist_pre(board, move)
                 board.push(move)
+                child_key = _zobrist_post(board, key, zpre)
                 gives_check = board.is_check()
 
                 if searched == 0:
                     score = -negamax(board, depth - 1 + one_reply_ext, -beta,
-                                     -alpha, ply + 1, move)
+                                     -alpha, ply + 1, move, key=child_key)
                 else:
                     reduction = 0
                     if is_quiet and depth >= 3 and not gives_check and move_index >= 3:
@@ -1313,17 +1416,17 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True):
                             reduction = depth - 2
 
                     score = -negamax(board, depth - 1 - reduction, -alpha - 1,
-                                     -alpha, ply + 1, move)
+                                     -alpha, ply + 1, move, key=child_key)
 
                     # The reduced search beat alpha, so redo it at full depth.
                     if reduction > 0 and score > alpha:
                         score = -negamax(board, depth - 1, -alpha - 1, -alpha,
-                                         ply + 1, move)
+                                         ply + 1, move, key=child_key)
 
                     # PVS re-search on a full window inside the bounds.
                     if alpha < score < beta:
                         score = -negamax(board, depth - 1, -beta, -alpha,
-                                         ply + 1, move)
+                                         ply + 1, move, key=child_key)
 
                 piece_type = board.piece_type_at(move.to_square)
                 board.pop()
@@ -1394,16 +1497,22 @@ def _root_window(board, root_moves, best_move, depth, alpha, beta, base_stack):
     iter_move = None
     iter_score = -INFINITY
     ordered = order_moves(board, root_moves, best_move, 0, None)
+    root_key = chess.polyglot.zobrist_hash(board)
 
     for index, move in enumerate(ordered):
+        zpre = _zobrist_pre(board, move)
         board.push(move)
+        child_key = _zobrist_post(board, root_key, zpre)
         try:
             if index == 0:
-                score = -negamax(board, depth - 1, -beta, -alpha, 1, move)
+                score = -negamax(board, depth - 1, -beta, -alpha, 1, move,
+                                 key=child_key)
             else:
-                score = -negamax(board, depth - 1, -alpha - 1, -alpha, 1, move)
+                score = -negamax(board, depth - 1, -alpha - 1, -alpha, 1, move,
+                                 key=child_key)
                 if alpha < score < beta:
-                    score = -negamax(board, depth - 1, -beta, -alpha, 1, move)
+                    score = -negamax(board, depth - 1, -beta, -alpha, 1, move,
+                                     key=child_key)
         except TimeUp:
             return iter_move, iter_score, False, False
         finally:
