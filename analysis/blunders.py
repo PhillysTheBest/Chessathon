@@ -156,13 +156,22 @@ def _verify_candidates(board, candidates, depth, *, verbose=False):
     for move in candidates:
         c0 = time.perf_counter()
         _reset_search_state()
+        # SAN must be read before the push, not after: on a TimeUp, the
+        # except block below runs before the finally that unwinds the
+        # board, so board.san(move) at that point would be asking about a
+        # move several/many plies stale against whatever position the leaked
+        # recursive pushes left behind - board.san() asserts the move is
+        # legal there and crashes. Caching it now, on the position this
+        # move is actually about to be played from, is correct at both
+        # print sites and cheaper besides.
+        san = board.san(move)
         board.push(move)
         try:
             score = -agent.negamax(
                 board, depth - 1, -agent.INFINITY, agent.INFINITY, 0, None)
         except agent.TimeUp:
             elapsed = time.perf_counter() - c0
-            print(f"      ...{board.san(move):8s} UNVERIFIED - hit the "
+            print(f"      ...{san:8s} UNVERIFIED - hit the "
                   f"{BUDGET_S:.0f}s safety ceiling ({elapsed:.1f}s), likely a "
                   f"forced-reply/check-extension chain", flush=True)
             continue
@@ -174,7 +183,7 @@ def _verify_candidates(board, candidates, depth, *, verbose=False):
                 board.pop()
         results[move] = score
         if verbose:
-            print(f"      ...{board.san(move):8s} {score:+6d}  "
+            print(f"      ...{san:8s} {score:+6d}  "
                   f"({time.perf_counter() - c0:.1f}s)", flush=True)
     return results
 
