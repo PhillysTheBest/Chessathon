@@ -1553,9 +1553,22 @@ FUTILITY_MARGIN = [0, 100, 180, 280, 400, 540, 700]
 RFP_MARGIN = 75
 LMP_COUNT = [0, 5, 8, 13, 20, 29, 40]
 
+# Singular extension, added under a live tournament deadline without a 40-game
+# arena to confirm it - see CLAUDE.md's Open Work item 4 and the round-62
+# investigation this responds to (a critical move that scores fine through a
+# shallow search and only reveals a forced win several plies deeper). Minimal
+# and heavily guarded on purpose: only a TT move from a deep, non-upper-bound
+# entry is ever tested, only at nodes already deep enough that the
+# verification search's cost (a full move-list generation plus a reduced
+# search over every alternative) stays rare. SINGULAR_EXT_ENABLED = False is
+# an instant rollback to the prior, arena-confirmed-adjacent behavior.
+SINGULAR_EXT_ENABLED = True
+SINGULAR_MIN_DEPTH = 8       # verification search only pays off when rare
+SINGULAR_MARGIN = 60         # cp the TT move must clear every alternative by
+
 
 def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None,
-            mg_eg_phase=None):
+            mg_eg_phase=None, excluded_move=None):
     SEARCH.nodes += 1
     SEARCH.check_time()
 
@@ -1600,7 +1613,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
     if tt_hit:
         packed_tt_move = int(TT_MOVE[index])
         tt_move = unpack_move(packed_tt_move) if packed_tt_move else None
-        if not is_pv and tt_depth >= depth and ply > 0:
+        if not is_pv and tt_depth >= depth and ply > 0 and excluded_move is None:
             score = int(TT_SCORE[index])
             # Mate scores are stored relative to the root; re-anchor them.
             if score > MATE_BOUND:
@@ -1689,9 +1702,36 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
     # it costs nothing beyond an empty list when it's off.
     tried_quiets: list[tuple[int, int, int]] = []
 
+    # Singular extension probe. excluded_move is None here for every ordinary
+    # node (this only ever runs one level deep - the verification call below
+    # passes excluded_move=tt_move, and that call's own guard on
+    # excluded_move is None then blocks a nested probe at the same position).
+    # If no other legal move can even reach within SINGULAR_MARGIN of the TT
+    # move's own score at half depth, the TT move is trusted as uniquely good
+    # here and searched one ply deeper than normal.
+    se_extension = 0
+    if (SINGULAR_EXT_ENABLED and excluded_move is None and ply > 0
+            and depth >= SINGULAR_MIN_DEPTH and tt_move_legal
+            and tt_hit and tt_depth >= depth - 3
+            and int(TT_FLAG[index]) != TT_UPPER):
+        tt_score = int(TT_SCORE[index])
+        if tt_score > MATE_BOUND:
+            tt_score -= ply
+        elif tt_score < -MATE_BOUND:
+            tt_score += ply
+        if abs(tt_score) < MATE_BOUND:
+            singular_beta = tt_score - SINGULAR_MARGIN
+            verify_depth = (depth - 1) // 2
+            se_score = negamax(board, verify_depth, singular_beta - 1,
+                                singular_beta, ply, prev_move,
+                                allow_null=allow_null, key=key,
+                                mg_eg_phase=mg_eg_phase, excluded_move=tt_move)
+            if se_score < singular_beta:
+                se_extension = 1
+
     SEARCH.path.append(key)
     try:
-        if tt_move_legal and tt_move is not None:
+        if tt_move_legal and tt_move is not None and tt_move != excluded_move:
             move = tt_move
             is_capture = bool(chess.BB_SQUARES[move.to_square] & them)
             is_quiet = not is_capture and not move.promotion
@@ -1700,8 +1740,9 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             child_mg_eg_phase = _child_eval(board, move, mg_eg_phase)
             board.push(move)
             child_key = _zobrist_post(board, key, zpre)
-            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move,
-                             key=child_key, mg_eg_phase=child_mg_eg_phase)
+            score = -negamax(board, depth - 1 + se_extension, -beta, -alpha,
+                             ply + 1, move, key=child_key,
+                             mg_eg_phase=child_mg_eg_phase)
             piece_type = board.piece_type_at(move.to_square)
             board.pop()
             searched = 1

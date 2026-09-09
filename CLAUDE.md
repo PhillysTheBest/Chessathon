@@ -225,6 +225,7 @@ this was discovered was measured in the shallow regime only.
 | v1.8 over v1.7 — numba-jitted material/PST/bishop pair | fast-clock arena was noise (51.2%/40 games, expected at that clock); kept on a bit-exact correctness proof instead |
 | v1.9 over v1.8 — forced-reply extension, numba mobility/king-zone jit, incremental Zobrist | not arena-confirmed at all, given a tournament deadline; each verified to the strongest correctness standard available for its kind instead (bit-exact parity, debug-assert against `chess.polyglot.zobrist_hash`, or direct before/after comparison) |
 | v20 over v1.9 (merged to main) — packed-int killers/counters/TT move slot + typed-array TT; numba-jitted SEE; incremental material/PST/phase eval | not arena-confirmed (see below); each phase verified to a correctness standard instead |
+| v21 over v20 — minimal singular extension | not arena-confirmed, and unlike v20 this genuinely cannot be: it changes which nodes get searched (see below). Shipped anyway under a live tournament deadline (2 days left, actively losing rated games); a diagnostic-position check substituted for the arena this class of change normally requires. `SINGULAR_EXT_ENABLED = False` is an instant rollback. |
 
 `submission.zip` is rebuilt from the current tree (main), not from a version
 proven to beat the ladder — none of v1.7-v20 have arena confirmation, only
@@ -276,6 +277,47 @@ nodes get visited and cached — the same risk class the staged TT-move-first
 search (`v1.7`) turned out to belong to despite looking behavior-preserving —
 so a correctness proof cannot substitute for it, and it was not implemented
 without a real 30-40 game arena to back it.
+
+**v21 (minimal singular extension), in more detail.** Built at the user's
+explicit request under a live tournament deadline (2 days left, rounds
+76-78 all lost), as the direct follow-on to the round-62/round-77 horizon
+investigation above. Deliberately minimal and heavily guarded: only tries
+when `depth >= SINGULAR_MIN_DEPTH` (8), there's a legal TT move from a
+non-upper-bound entry no more than 3 ply shallower than the current node,
+and the TT score isn't already mate-adjacent. When it tries, it re-searches
+every *other* legal move at half depth in a null window just below the TT
+score minus `SINGULAR_MARGIN` (60cp); if nothing else even reaches that bar,
+the TT move is trusted as uniquely good and searched one ply deeper.
+Implemented as an `excluded_move` parameter threaded through `negamax`
+(defaults to `None` everywhere else, so no other call site changes), with
+the verification call passing `excluded_move=tt_move` and its own
+`excluded_move is None` guard preventing a nested probe at the same node.
+
+Explicitly **not correctness-verified in the sense the rest of this section
+means** — it changes which nodes get searched and to what depth, the exact
+risk class this file's own methodology says an arena has to confirm, not a
+proof. What substituted for the arena, given the deadline: the gate, the
+self-test at both a short and a realistic (120s) clock, a full sanity game
+to checkmate via `harness.play` (`--base-ms 15000 --increment-ms 200`, no
+crashes or illegal moves), the scenario suite (18/22 vs the prior 17/22, not
+a meaningful delta at this sample size), and direct before/after checks on
+the known regression corpus at the depths where the feature can actually
+fire (nominal depth >= 8, since it's a no-op below that — most of the
+diagnostic sweeps used to find it, at depth 5-7, cannot exercise it at all
+and show it as bit-identical to baseline there, which is expected, not
+evidence of safety at the depths that matter). Direct effect on the corpus
+was mixed, not a clean win: inert on round 62 and round 77 themselves at
+every depth cheaply testable (neither position's critical node reaches
+depth 8 within a budget this investigation could afford); on round 46 it
+triggers at depth 10 and shifts the score from 94 to 52 (closer to depth 9's
+54, arguably more stable) at roughly 8x the node cost; on round 74 it
+triggers at depth 9-10 and moves the score by 90-140cp in both directions
+across those two depths (not monotonically toward the confirmed value),
+roughly doubling node cost. No case found where it made a position *fail*
+(no crash, no illegal move, no node-count blowup past what a real clock
+would tolerate in the positions tested) but no case found where it clearly
+fixed the target failure family either. `SINGULAR_EXT_ENABLED = False` is
+the rollback if it turns out to cost more games than it saves.
 
 ### The single most important result
 
@@ -689,8 +731,13 @@ arena's default fast clock; **re-confirm any winner at realistic clock**
    bitboards, or the o^(o-2r) trick) — only worth it if the open-position
    slowdown documented above turns out to matter in practice; simple
    ray-casting was the deliberate lower-risk choice the first time.
-4. **Singular extensions.** Present in the 5x5 engine, never ported. Contested
-   — they may only pay from depth 10. One arena settles it.
+4. ~~Singular extensions~~ — a minimal, heavily guarded version shipped in
+   v21 under a tournament deadline, without the arena this item always said
+   would settle it (see the v21 entry above for exactly what substituted).
+   **The arena is still owed.** Mixed diagnostic results on the known
+   regression corpus, inert on the two positions (round 62, round 77) it was
+   built to help. `SINGULAR_EXT_ENABLED = False` reverts it if it costs more
+   than it saves once there's time to actually run one.
 5. **Unconfound LMP from futility.** Build a diagnostic-only variant with
    `FUTILITY_MARGIN` set unreachably high, then sweep `LMP_COUNT` tight/loose
    against *that*, never against a real baseline. If a real gradient appears
