@@ -192,7 +192,7 @@ of phantom loss on moves that were in fact best. If a move where played equals
 best does not report exactly 0 loss, the methodology is broken.
 
 `analysis/positions.epd` is the scenario suite: a FEN plus a move that must be
-found (`bm`) or must not be played (`am`), grouped by theme. Currently 14/18.
+found (`bm`) or must not be played (`am`), grouped by theme. Currently 17/22.
 Add a line whenever a rated game exposes a weakness. `kingsafety` and `endgame`
 are the thinnest themes. The suite's wall-clock timing has real run-to-run
 noise near a depth-completion boundary — before concluding a code change
@@ -457,6 +457,18 @@ left the board several plies deep afterward with no error at all — fixed by
 unwinding to the pre-candidate stack depth in a `finally`, the same
 invariant `_root_window` already protects in `agent.py` itself.
 
+That fix covered the search call; it missed the diagnostic print. Analysing
+rounds 76-78 this session hit `_verify_candidates`' `except TimeUp:` branch
+twice in one sitting, and both times it crashed: the branch's own
+`print(f"...{board.san(move)}...")` runs *before* the `finally` that unwinds
+`board`, so it reads `board.san(move)` while `board` is still sitting several
+plies deep in the leaked recursive pushes — `python-chess` asserts the move
+illegal there and the whole run dies mid-analysis, right on the sharp forcing
+lines this tool exists to explain. Fixed the same way as any other
+stale-board read: compute `san = board.san(move)` once, before the push, and
+reuse that string at both print sites instead of re-deriving it after the
+fact.
+
 - **Round 72** was lost by checkmate as Black. A different profile from every
   prior loss: **nothing crossed the 150cp blunder threshold anywhere in the
   game.** The score sat near-equal through move 16, then move 17 (`Bg4`
@@ -485,6 +497,55 @@ invariant `_root_window` already protects in `agent.py` itself.
   the deepest depth reached — this position's difficulty is real even for
   search itself, not just an artifact of `analysis.blunders`' reset-state
   methodology. Both rounds' regression positions are in the suite.
+- **Round 76** was lost by checkmate as White. Score drifted from +185 after
+  move 13 to -350 by move 30 under a long run of moves that all matched
+  `analysis.blunders`' own best-move pick — round 49's "being outplayed"
+  profile, not a bug. One clean tactical point on top of an already-lost
+  position: move 50, `Kc8` walks into forced mate (confirmed, -29993) where
+  `Kd6` (-1202) stays hopeless but not forced, computed on a genuinely tiny
+  low-clock budget (793/1268ms, phase 5/24, depth 6 reached). Regression
+  position is in the suite; lower diagnostic value than 77/78 below since the
+  game was decided long before this move.
+- **Round 77** was lost by checkmate as Black despite being +330 to +450 for
+  most of the second half of the game — the most interesting of this
+  session's three losses, because `analysis.blunders`' default 150cp scan
+  found **nothing wrong anywhere in the game.** Stage 1's shallow (depth 4)
+  pass agreed with every move actually played, including the fatal one:
+  move 67, `f4`, scored +55 at depth 4 and still +23 in the real game's own
+  depth-7 search. Forcing a clean, reset-state depth-10 verification
+  (`--force-deep`) shows `f4` is a forced mate (-29993), while `Kg8` was
+  sitting right there, only very bad and not forced (-152) — a ~29800cp gap
+  between two moves that looked equally "merely bad" at every depth the real
+  game or a normal shallow scan ever reached. This is the cleanest isolation
+  of the round-46/62/68/74 family so far, because both candidates were
+  re-verified with *identical* reset state at the same depth — the gap is
+  attributable to depth alone, not to ordering/LMR/pruning artifacts from
+  whatever TT/history state the real game's search happened to be carrying.
+  No case was found where a correctly-scored better move existed at a depth
+  actually reached and got demoted by ordering, LMR, or pruning; `Kg8` simply
+  wasn't distinguishable from `f4` until three plies past where either the
+  shallow scan or the real 14-second-clock endgame search stopped. Regression
+  position is in the suite.
+- **Round 78** was lost by checkmate as White. Same grind profile as 76 from
+  move ~22 to move 41, then two *independently confirmed real blunders* —
+  unlike round 77, neither is a horizon miss: both resolve cleanly at the
+  standard depth-7 verification, and Stage 1's own shallow depth-4 scan
+  already preferred the better move in both cases. Move 42, `h4`, ignores a
+  Black pawn one square from queening on b2 (`Qxd3`, winning the knight
+  instead, was available and scores 315cp better). Move 49, `Qd8+`, throws
+  away another 684cp two moves before the actual mate. Both regression
+  positions are in the suite.
+
+None of the three required a code fix in `agent.py` itself — no illegal
+moves, no crashes, no clock flags in any of the three logs, and the one
+budget overrun found (round 76 move 9, 59ms past the hard deadline) is
+`check_time()`'s documented once-per-1024-nodes granularity working as
+designed, not a bug. Round 77 is a fifth confirmed instance of the
+round-46/62/68/74 failure family (fine at the depth reached, forced past it)
+and, notably, the cleanest one yet to isolate mechanically — but per the
+project's own standard, that observation is not itself grounds to act on
+Open Work item 4 (singular extensions) without the targeted-trace-first
+process this session followed for round 77.
 
 `analysis/trace.py` was added this session, built on an optional trace
 callback threaded through `search_root`/`_root_window` in `agent.py` (`None`

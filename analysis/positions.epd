@@ -72,3 +72,36 @@ r3kb1r/pp1b1ppp/4p3/3pP3/P2N1P2/3Q4/1qPBK1PP/R6R b kq - 3 15 ; id "r46: Bc5 lose
 # real even for search itself, not just a byproduct of analysis.blunders'
 # reset-state methodology.
 4n1k1/p1p3p1/7p/3qB2Q/4p3/6RP/5r1K/8 w - - 0 36 ; id "r74 m36: Kh1 invites ...e3+, play Kg1" ; theme regression ; am Kh1
+# Round 76, lost by checkmate. Mostly a long grind (score drifted from +185
+# after move 13 to -350 by move 30 under moves that all matched
+# analysis.blunders' own best-move pick - r49's "being outplayed" profile,
+# not a bug). The one clean tactical point: move 50, Kc8 walks into forced
+# mate (-29993, confirmed) where Kd6 (-1202) stays hopeless but not forced.
+# Computed on a low-clock budget (793/1268ms, phase 5/24, depth 6 reached) -
+# a low-clock instance of the same missed-forced-sequence family, in an
+# already-lost position. Lower diagnostic value than r77/r78 below since the
+# result was essentially decided long before this move.
+8/2PK4/5k2/P7/5P2/8/6b1/7q w - - 0 50 ; id "r76 m50: Kc8 walks into mate, play Kd6" ; theme regression ; am Kc8
+# Round 77, lost by checkmate as Black despite being +330 to +450 for most of
+# the second half of the game. analysis.blunders' default 150cp scan found
+# NOTHING, because Stage 1's shallow (depth 4) pass agreed with every move
+# played, including this one - move 67, f4, scored +55 at depth 4 and still
+# +23 in the real game's own depth-7 search. A clean, reset-state depth-10
+# verification (analysis.blunders --force-deep) shows f4 is a forced mate
+# (-29993), while Kg8 was available and only very bad, not forced (-152) -
+# a genuine ~29800cp swing between two moves that looked equally "merely bad"
+# at every depth actually reached. Same family as r46/r62/r68/r74 (looks fine
+# through the depth reached, forced sequence a few plies past it) but the
+# cleanest isolation yet: both candidates were re-verified with identical
+# reset state at the same depth, so the gap is attributable to depth alone,
+# not to ordering/LMR/pruning artifacts from accumulated real-game state.
+7k/8/P1b3K1/5p2/8/1p5p/4R3/8 b - - 0 67 ; id "r77 m67: f4 is a forced mate, play Kg8" ; theme regression ; am f4
+# Round 78, lost by checkmate. Same grind profile from move ~22 to move 41,
+# then two independently confirmed real blunders (not horizon misses - both
+# resolve cleanly at the standard depth-7 verification, and Stage 1's own
+# shallow depth-4 scan already preferred the better move in both cases).
+# Move 42, h4 ignores Black's b2 pawn one square from queening; Qxd3 at
+# least wins the knight instead. Move 49, Qd8+ throws away another 684cp
+# two moves before the actual mate.
+5rk1/5pp1/1R1Q2p1/6P1/8/3n1NKP/1p3P2/2q5 w - - 0 42 ; id "r78 m42: h4 ignores the b2 pawn, play Qxd3" ; theme regression ; am h4
+6k1/5pp1/1Q4p1/6P1/4r2P/3n1NK1/5P2/5q2 w - - 10 49 ; id "r78 m49: Qd8+ throws away 684cp, play Qb8+" ; theme regression ; am Qd8+

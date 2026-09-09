@@ -263,7 +263,7 @@ comparing a child search against a parent search is not, and produced 300 cp of
 phantom loss on moves that were in fact best.
 
 `suite.py` runs `positions.epd`, where each line is a FEN plus a move the engine
-must find or must not play, grouped by theme. Currently 12/15 at the suite's
+must find or must not play, grouped by theme. Currently 17/22 at the suite's
 default 3-second-per-position budget (that number itself has some inherent
 run-to-run timing noise near depth-completion boundaries, confirmed this
 session by replaying an identical `search_root` call twice and getting
@@ -271,7 +271,7 @@ byte-identical results — the suite's wall-clock methodology is more sensitive
 to that than it first appears). Every rated game that exposes a weakness adds a
 line.
 
-### What the tools found in three losses
+### What the tools found in three losses (plus three more since)
 
 - **Round 46** — one deep tactical miss. The losing move scored +166 at depth 4,
   +94 at depth 8, and −195 at depth 9. The engine reached depth 7 in the game.
@@ -292,6 +292,18 @@ line.
   line (after `Nxf5+`, the king has exactly one legal reply) but is not enough
   on its own to flip the result — the actual refutation needs more than one
   extra ply there.
+- **Rounds 76-78**, three further rated losses, none needing a code fix (no
+  illegal moves, no crashes, no flag losses in any of the three). 76 and 78
+  are mostly the round-49 "being outplayed" profile again, each with one or
+  two moves confirmed as real >150cp errors late in an already-bad position.
+  Round 77 is the clean case: Black was +330 to +450 for most of the second
+  half of the game, then lost to a move (`f4`) that scored positive at every
+  depth a normal shallow scan or the real game's own clock-limited search
+  ever reached, but is a confirmed forced mate three plies further in, with a
+  much better move sitting right there and not taken. Same family as round
+  46/62 — search depth on a forcing sequence, not evaluation — and the
+  cleanest isolation of it so far, since both moves were re-verified with
+  identical reset state at the same depth.
 
 ---
 
