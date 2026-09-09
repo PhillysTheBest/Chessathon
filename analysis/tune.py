@@ -53,6 +53,22 @@ VARIANTS: dict[str, tuple[str, str]] = {
     # `+= depth * depth` accumulate. See HISTORY_AGING_ENABLED's own comment.
     "history-aging": (r"^HISTORY_AGING_ENABLED = .*",
                        "HISTORY_AGING_ENABLED = True"),
+
+    # Forced-reply extension disabled, to measure its net effect.
+    "no-forced-reply": (r"^            one_reply_ext = 1 if len\(moves\) == 1 else 0$",
+                         "            one_reply_ext = 0"),
+
+    # Futility disabled (unreachable margin) to isolate LMP's real signal.
+    "fut-disabled": (r"^FUTILITY_MARGIN = .*",
+                      "FUTILITY_MARGIN = [0, 30000, 30000, 30000, 30000, 30000, 30000]"),
+
+    # NMP reduction formula variants. The baseline is reduction = 2 + depth // 6.
+    "nmp-aggressive": (r"^                reduction = 2 \+ depth // 6$",
+                        "                reduction = 3 + depth // 4"),
+    "nmp-conservative": (r"^                reduction = 2 \+ depth // 6$",
+                          "                reduction = 2"),
+    "nmp-stockfish":  (r"^                reduction = 2 \+ depth // 6$",
+                        "                reduction = 3 + depth // 3"),
 }
 
 

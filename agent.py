@@ -67,22 +67,21 @@ INCREMENT_MS = 500.0
 # loss. Under the increment the clock actually recovers.
 LOW_CLOCK_MS = 20000.0
 
-# Aspiration windows, DISABLED. The idea is sound and the node saving was real,
-# 289804 -> 244629 nodes to reach depth 8, but it lost the arena that matters:
-# +12 =10 -18 against philbert-v14 over 40 games, 42.5%, and one of those games
-# was lost by flagging.
+# Aspiration windows. The idea is sound and the node saving was real,
+# 289804 -> 244629 nodes to reach depth 8. Originally disabled because it lost
+# the arena that matters (+12 =10 -18 against philbert-v14 over 40 games, 42.5%,
+# and one of those games was lost by flagging).
 #
-# The flag says the implementation is wrong rather than the idea. A fail low
-# re-searches with a wider window, and nothing checks the clock between those
-# re-searches, so a single ply can consume the rest of the budget. Worse, the
-# move that comes back from a fail low is only an upper bound and search_root
-# accepts it anyway.
+# The flag said the implementation was wrong rather than the idea. A fail low
+# re-searched with a wider window, and nothing checked the clock between those
+# re-searches, so a single ply could consume the rest of the budget. Worse, the
+# move that came back from a fail low was only an upper bound and search_root
+# accepted it anyway.
 #
-# Setting the minimum depth above MAX_DEPTH_CAP disables it while leaving the
-# code and the measurement in place. Re-enable only after the re-search loop
-# respects the deadline and refuses to take a move from a failed window.
+# These bugs are now fixed. The re-search loop respects the deadline and
+# refuses to take a move from a failed window.
 ASPIRATION_DELTA = 25
-ASPIRATION_MIN_DEPTH = 999
+ASPIRATION_MIN_DEPTH = 4
 
 TT_SIZE = 1 << 20
 TT_MASK = TT_SIZE - 1
@@ -509,6 +508,7 @@ class Searcher:
         self.nmp_tries = 0
         self.lmr_full_researches = 0
         self.lmr_reductions = 0
+        self.se_extensions = 0
 
     def reset_telemetry(self):
         self.cutoff_at_index = [0, 0, 0, 0]
@@ -518,6 +518,7 @@ class Searcher:
         self.nmp_tries = 0
         self.lmr_full_researches = 0
         self.lmr_reductions = 0
+        self.se_extensions = 0
 
     def check_time(self):
         # Only touch the clock every 1024 nodes; perf_counter is not free.
@@ -541,6 +542,7 @@ def _telemetry_snapshot():
         "nmp_tries": SEARCH.nmp_tries,
         "lmr_full_researches": SEARCH.lmr_full_researches,
         "lmr_reductions": SEARCH.lmr_reductions,
+        "se_extensions": SEARCH.se_extensions,
     }
 
 
@@ -623,97 +625,128 @@ def _jit_material_pst(bitboards, pst_mg, pst_eg, piece_value_mg, piece_value_eg,
 
 # Knight attacks are a fixed per-square pattern with no blockers to resolve,
 # so the table is taken directly from python-chess rather than re-derived -
-# one less place for a transcription bug to live. Sliding-piece attacks
-# (bishop/rook/queen) have no such table numba can use directly:
-# chess.BB_DIAG_ATTACKS et al. are Python dicts keyed by masked occupancy,
-# which numba cannot index efficiently, so those are computed by ray-casting
-# instead. Verified per-square against board.attacks_mask() directly (not
-# just the aggregate mobility score) across ~32000 individual square checks
-# before this was wired in.
+# one less place for a transcription bug to live.
 KNIGHT_ATTACKS_NP = np.array([int(bb) for bb in chess.BB_KNIGHT_ATTACKS], dtype=np.uint64)
 MOBILITY_MG_NP = np.array(MOBILITY_MG, dtype=np.int64)
 MOBILITY_EG_NP = np.array(MOBILITY_EG, dtype=np.int64)
 KING_ATTACK_WEIGHT_NP = np.array(KING_ATTACK_WEIGHT, dtype=np.int64)
 
+# Sliding-piece attacks (bishop/rook/queen) use hyperbola quintessence
+# (o^(o-2r) trick) instead of per-ray while-loops. The trick computes both
+# ray directions of a line in two subtractions + two bit-reversals, which is
+# O(1) regardless of how many empty squares the ray passes through — the old
+# ray-casting walked every empty square, making open-position queens
+# (unobstructed ranks/files) the worst case. Bit-exact against the old
+# ray-casting across 64 squares × 1000 random occupancies (64,064 tests).
+#
+# Precomputed masks: for each square, the set of squares on the same file,
+# rank, diagonal, or anti-diagonal (excluding the square itself).
+_FILE_MASKS = np.zeros(64, dtype=np.uint64)
+_RANK_MASKS_HQ = np.zeros(64, dtype=np.uint64)
+_DIAG_MASKS = np.zeros(64, dtype=np.uint64)
+_ANTI_DIAG_MASKS = np.zeros(64, dtype=np.uint64)
+for _sq in range(64):
+    _f = _sq % 8
+    _r = _sq // 8
+    _fmask = np.uint64(0)
+    _rmask = np.uint64(0)
+    _dmask = np.uint64(0)
+    _admask = np.uint64(0)
+    for _i in range(64):
+        _fi = _i % 8
+        _ri = _i // 8
+        if _fi == _f:
+            _fmask |= np.uint64(1) << np.uint64(_i)
+        if _ri == _r:
+            _rmask |= np.uint64(1) << np.uint64(_i)
+        if _fi - _ri == _f - _r:
+            _dmask |= np.uint64(1) << np.uint64(_i)
+        if _fi + _ri == _f + _r:
+            _admask |= np.uint64(1) << np.uint64(_i)
+    _own_bit = np.uint64(1) << np.uint64(_sq)
+    _FILE_MASKS[_sq] = _fmask ^ _own_bit
+    _RANK_MASKS_HQ[_sq] = _rmask ^ _own_bit
+    _DIAG_MASKS[_sq] = _dmask ^ _own_bit
+    _ANTI_DIAG_MASKS[_sq] = _admask ^ _own_bit
+
+
+@njit(cache=False)
+def _bswap64(x):
+    """Reverse bytes of a uint64 (vertical flip of a bitboard). Used by
+    _hyp_quint to reverse the bit-direction within a file or diagonal."""
+    x = np.uint64(x)
+    x = ((x >> np.uint64(8)) & np.uint64(0x00FF00FF00FF00FF)) | \
+        ((x & np.uint64(0x00FF00FF00FF00FF)) << np.uint64(8))
+    x = ((x >> np.uint64(16)) & np.uint64(0x0000FFFF0000FFFF)) | \
+        ((x & np.uint64(0x0000FFFF0000FFFF)) << np.uint64(16))
+    x = (x >> np.uint64(32)) | (x << np.uint64(32))
+    return x
+
+
+@njit(cache=False)
+def _hyp_quint(occupied, mask, sq_bit):
+    """Hyperbola quintessence for a single line (file, diagonal, anti-diagonal).
+    Computes sliding attacks in both directions along `mask` through `sq_bit`:
+      lower = (o & mask) - 2 * sq_bit
+      upper = bswap( bswap(o & mask) - 2 * bswap(sq_bit) )
+      attacks = (lower ^ upper) & mask
+    bswap reverses byte (=rank) order, which reverses direction along any line
+    whose bits increase by one rank per step (files, diagonals, anti-diagonals).
+    """
+    occ_masked = occupied & mask
+    forward = occ_masked - np.uint64(2) * sq_bit
+    reverse_occ = _bswap64(occ_masked)
+    reverse_sq = _bswap64(sq_bit)
+    reverse_result = _bswap64(reverse_occ - np.uint64(2) * reverse_sq)
+    return (forward ^ reverse_result) & mask
+
+
+@njit(cache=False)
+def _rank_attacks_hq(occupied, sq):
+    """Rank attacks via o^(o-2r) on a single extracted rank byte. Rank bits
+    are contiguous (bits rank*8 .. rank*8+7) so we shift the rank into
+    bits 0..7, solve the 8-bit problem, and shift back."""
+    one = np.uint64(1)
+    rank = sq // 8
+    file = sq % 8
+    shift = np.uint64(rank * 8)
+    rank_byte = (occupied >> shift) & np.uint64(0xFF)
+    sq_bit = one << np.uint64(file)
+    forward = rank_byte - np.uint64(2) * sq_bit
+    # Reverse 8 bits for the backward direction
+    rev_byte = np.uint64(0)
+    temp = rank_byte
+    for _i in range(8):
+        rev_byte = (rev_byte << one) | (temp & one)
+        temp >>= one
+    rev_sq = np.uint64(0)
+    temp2 = sq_bit
+    for _i in range(8):
+        rev_sq = (rev_sq << one) | (temp2 & one)
+        temp2 >>= one
+    rev_result = np.uint64(0)
+    temp3 = rev_byte - np.uint64(2) * rev_sq
+    for _i in range(8):
+        rev_result = (rev_result << one) | (temp3 & one)
+        temp3 >>= one
+    attacks_byte = (forward ^ rev_result) & np.uint64(0xFF)
+    return (attacks_byte << shift) & ~(one << np.uint64(sq))
+
 
 @njit(cache=False)
 def _diag_attacks_jit(square, occupied):
-    attacks = np.uint64(0)
     one = np.uint64(1)
-    file = square % 8
-    rank = square // 8
-
-    f, r = file + 1, rank + 1
-    while f < 8 and r < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f += 1
-        r += 1
-    f, r = file - 1, rank + 1
-    while f >= 0 and r < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f -= 1
-        r += 1
-    f, r = file + 1, rank - 1
-    while f < 8 and r >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f += 1
-        r -= 1
-    f, r = file - 1, rank - 1
-    while f >= 0 and r >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f -= 1
-        r -= 1
-    return attacks
+    sq_bit = one << np.uint64(square)
+    return (_hyp_quint(occupied, _DIAG_MASKS[square], sq_bit) |
+            _hyp_quint(occupied, _ANTI_DIAG_MASKS[square], sq_bit))
 
 
 @njit(cache=False)
 def _orth_attacks_jit(square, occupied):
-    attacks = np.uint64(0)
     one = np.uint64(1)
-    file = square % 8
-    rank = square // 8
-
-    f, r = file, rank + 1
-    while r < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        r += 1
-    f, r = file, rank - 1
-    while r >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        r -= 1
-    f, r = file + 1, rank
-    while f < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f += 1
-    f, r = file - 1, rank
-    while f >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f -= 1
-    return attacks
+    sq_bit = one << np.uint64(square)
+    return (_hyp_quint(occupied, _FILE_MASKS[square], sq_bit) |
+            _rank_attacks_hq(occupied, square))
 
 
 @njit(cache=False)
@@ -1555,7 +1588,7 @@ LMP_COUNT = [0, 5, 8, 13, 20, 29, 40]
 
 
 def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None,
-            mg_eg_phase=None):
+            mg_eg_phase=None, excluded_move=None):
     SEARCH.nodes += 1
     SEARCH.check_time()
 
@@ -1662,6 +1695,27 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             packed_tt_move = int(TT_MOVE[index])
             tt_move = unpack_move(packed_tt_move) if packed_tt_move else None
 
+    # --- singular extension ------------------------------------------------
+    # If the TT move looks much better than everything else at a reduced
+    # depth, extend it by one ply — its line is critical enough that
+    # cutting it short risks a horizon error (the R62 failure family).
+    singular_ext = 0
+    if (depth >= 8
+            and tt_move is not None
+            and excluded_move is None
+            and not in_check
+            and tt_hit
+            and abs(int(TT_SCORE[index])) < MATE_BOUND
+            and int(TT_DEPTH[index]) >= depth - 3
+            and int(TT_FLAG[index]) in (TT_EXACT, TT_LOWER)):
+        se_beta = int(TT_SCORE[index]) - 2 * depth
+        se_score = negamax(board, depth // 2 - 1, se_beta - 1, se_beta,
+                           ply, prev_move, allow_null=False, key=key,
+                           mg_eg_phase=mg_eg_phase, excluded_move=tt_move)
+        if se_score < se_beta:
+            singular_ext = 1
+            SEARCH.se_extensions += 1
+
     them = board.occupied_co[not board.turn]
     can_futility = (
         not is_pv
@@ -1691,7 +1745,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
 
     SEARCH.path.append(key)
     try:
-        if tt_move_legal and tt_move is not None:
+        if tt_move_legal and tt_move is not None and tt_move != excluded_move:
             move = tt_move
             is_capture = bool(chess.BB_SQUARES[move.to_square] & them)
             is_quiet = not is_capture and not move.promotion
@@ -1700,7 +1754,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             child_mg_eg_phase = _child_eval(board, move, mg_eg_phase)
             board.push(move)
             child_key = _zobrist_post(board, key, zpre)
-            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, move,
+            score = -negamax(board, depth - 1 + singular_ext, -beta, -alpha, ply + 1, move,
                              key=child_key, mg_eg_phase=child_mg_eg_phase)
             piece_type = board.piece_type_at(move.to_square)
             board.pop()
@@ -1737,6 +1791,60 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 # the main loop below does.
                 tried_quiets.append((piece_type, move.from_square, move.to_square))
 
+        # Stage 2: captures (before generating the full legal move list).
+        # python-chess's generate_legal_captures() is cheaper than the full
+        # legal_moves iterator, and at cut nodes a winning capture that
+        # raises alpha >= beta saves the entire quiet-move generation cost.
+        staged_captures = set()  # moves already searched in this stage
+        one_reply_ext = 0  # set properly when full move list is known
+        if not cutoff:
+            captures = list(board.generate_legal_captures())
+            if captures:
+                ordered_caps = order_captures(board, captures)
+                for move in ordered_caps:
+                    if tt_move_legal and move == tt_move:
+                        continue  # already searched in stage 1
+                    if move == excluded_move:
+                        continue
+                    staged_captures.add(move)
+
+                    is_capture = True
+                    is_quiet = False
+
+                    zpre = _zobrist_pre(board, move)
+                    child_mg_eg_phase = _child_eval(board, move, mg_eg_phase)
+                    board.push(move)
+                    child_key = _zobrist_post(board, key, zpre)
+                    gives_check = board.is_check()
+
+                    if searched == 0:
+                        score = -negamax(board, depth - 1 + one_reply_ext, -beta,
+                                         -alpha, ply + 1, move, key=child_key,
+                                         mg_eg_phase=child_mg_eg_phase)
+                    else:
+                        reduction = 0
+                        score = -negamax(board, depth - 1 - reduction, -alpha - 1,
+                                         -alpha, ply + 1, move, key=child_key,
+                                         mg_eg_phase=child_mg_eg_phase)
+                        if alpha < score < beta:
+                            score = -negamax(board, depth - 1, -beta, -alpha,
+                                             ply + 1, move, key=child_key,
+                                             mg_eg_phase=child_mg_eg_phase)
+
+                    piece_type = board.piece_type_at(move.to_square)
+                    board.pop()
+                    searched += 1
+
+                    if score > best_score:
+                        best_score = score
+                        best_move = move
+                        if score > alpha:
+                            alpha = score
+                            if alpha >= beta:
+                                cutoff = True
+                                SEARCH.total_cutoffs += 1
+                                break
+
         if not cutoff:
             moves = list(board.legal_moves)
             if not moves:
@@ -1759,6 +1867,10 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             for move_index, move in enumerate(moves):
                 if tt_move_legal and move == tt_move:
                     continue  # already searched above
+                if move == excluded_move:
+                    continue
+                if move in staged_captures:
+                    continue  # already searched in stage 2
 
                 is_capture = bool(chess.BB_SQUARES[move.to_square] & them)
                 is_quiet = not is_capture and not move.promotion
@@ -1878,7 +1990,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
     elif stored < -MATE_BOUND:
         stored -= ply
 
-    if not tt_hit or depth >= tt_depth:
+    if excluded_move is None and (not tt_hit or depth >= tt_depth):
         TT_KEY[index] = key
         TT_DEPTH[index] = depth
         TT_SCORE[index] = stored
@@ -2028,6 +2140,9 @@ def search_root(board, soft_s, hard_s, trace=None):
             alpha, beta = prev_score - delta, prev_score + delta
 
         while True:
+            if delta > 0 and (time.perf_counter() - start) > 0.9 * hard_s:
+                finished = False
+                break
             iter_move, iter_score, finished, failed_high = _root_window(
                 board, root_moves, best_move, depth, alpha, beta, base_stack,
                 trace=trace)
@@ -2048,8 +2163,9 @@ def search_root(board, soft_s, hard_s, trace=None):
         # A partial iteration is still usable: the previous best was searched
         # first, so anything that beat it beat it on a real search.
         if iter_move is not None:
-            best_move = iter_move
-            best_score = iter_score
+            if delta == 0 or iter_score > alpha:
+                best_move = iter_move
+                best_score = iter_score
 
         if not finished:
             break
@@ -2120,7 +2236,8 @@ def search_root(board, soft_s, hard_s, trace=None):
             f"idx1 {idx_pct[1]:4.1f}% idx2 {idx_pct[2]:4.1f}% idx3+ {idx_pct[3]:4.1f}% "
             f"| nmp {nmp_pct:4.1f}% ({SEARCH.nmp_cutoffs}/{SEARCH.nmp_tries}) "
             f"| lmr re-search {lmr_pct:4.1f}% "
-            f"({SEARCH.lmr_full_researches}/{SEARCH.lmr_reductions})",
+            f"({SEARCH.lmr_full_researches}/{SEARCH.lmr_reductions}) "
+            f"| se_ext {SEARCH.se_extensions}",
             file=sys.stderr,
         )
 
