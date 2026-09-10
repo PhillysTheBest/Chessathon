@@ -28,7 +28,9 @@ clock starts.
 """
 
 import contextlib
+import io
 import math
+import pkgutil
 import sys
 import time
 
@@ -67,22 +69,17 @@ INCREMENT_MS = 500.0
 # loss. Under the increment the clock actually recovers.
 LOW_CLOCK_MS = 20000.0
 
-# Aspiration windows, DISABLED. The idea is sound and the node saving was real,
-# 289804 -> 244629 nodes to reach depth 8, but it lost the arena that matters:
-# +12 =10 -18 against philbert-v14 over 40 games, 42.5%, and one of those games
-# was lost by flagging.
-#
-# The flag says the implementation is wrong rather than the idea. A fail low
-# re-searches with a wider window, and nothing checks the clock between those
-# re-searches, so a single ply can consume the rest of the budget. Worse, the
-# move that comes back from a fail low is only an upper bound and search_root
-# accepts it anyway.
-#
-# Setting the minimum depth above MAX_DEPTH_CAP disables it while leaving the
-# code and the measurement in place. Re-enable only after the re-search loop
-# respects the deadline and refuses to take a move from a failed window.
+# Aspiration windows start at depth 5, where the prior iteration is useful as
+# a score estimate. A failed window is never accepted as an iteration result:
+# the loop widens and re-searches, and force-checks the hard deadline before
+# every attempt so a string of re-searches cannot flag the game.
 ASPIRATION_DELTA = 25
-ASPIRATION_MIN_DEPTH = 999
+ASPIRATION_MIN_DEPTH = 5
+
+# A compact project-trained neural evaluator can be packaged at this path. It
+# is deliberately optional: without a validated, locally trained weight file,
+# the hand-written evaluator remains the source of truth.
+NNUE_RESOURCE = "weights/nnue.npz"
 
 # 32M entries * 15 bytes = about 480 MiB, leaving ample room within the 2 GiB
 # competition limit while preventing a single deep search from thrashing the TT.
@@ -405,6 +402,13 @@ HISTORY = [[[0] * 64 for _ in range(64)] for _ in range(7)]
 KILLERS = [[0, 0] for _ in range(MAX_PLY)]
 COUNTER = [[0] * 64 for _ in range(64)]
 
+# Continuation history learns which quiet move follows the prior one or two
+# half-moves.  A 12-bit from/to move key is enough here because promotions are
+# never quiet.  Two 4096 x 4096 int16 tables cost 64 MiB, small beside the TT
+# while avoiding a hot-path Python dict.
+CONTINUATION_HISTORY = np.zeros((2, 4096, 4096), dtype=np.int16)
+CONTINUATION_MAX = 8192
+
 # History aging, EXPERIMENTAL. Off by default - the shipped behavior is the
 # flat, unbounded `+= depth * depth` at HISTORY's two update sites in
 # negamax. When on, a cutoff-causing quiet move gets a bounded gravity bonus
@@ -428,6 +432,23 @@ def _history_update(container, index, bonus):
     negative (a malus)."""
     h = container[index]
     container[index] = h + bonus - h * abs(bonus) // HISTORY_MAX
+
+
+def _move_history_index(move):
+    """12-bit from/to key for quiet-move history tables."""
+    return move.from_square | (move.to_square << 6)
+
+
+def _continuation_update(prev_move, prev_prev_move, move, depth):
+    """Reward a quiet cutoff in one- and two-ply continuation tables."""
+    current = _move_history_index(move)
+    bonus = min(depth * depth, CONTINUATION_MAX)
+    for distance, earlier in enumerate((prev_move, prev_prev_move)):
+        if earlier is None:
+            continue
+        row = CONTINUATION_HISTORY[distance, _move_history_index(earlier)]
+        value = int(row[current])
+        row[current] = value + bonus - value * bonus // CONTINUATION_MAX
 
 # Late move reduction table, indexed [depth][move_index].
 LMR = [[0] * 64 for _ in range(64)]
@@ -521,9 +542,9 @@ class Searcher:
         self.lmr_full_researches = 0
         self.lmr_reductions = 0
 
-    def check_time(self):
+    def check_time(self, force=False):
         # Only touch the clock every 1024 nodes; perf_counter is not free.
-        if self.nodes & 1023 == 0 and time.perf_counter() >= self.hard_deadline:
+        if (force or self.nodes & 1023 == 0) and time.perf_counter() >= self.hard_deadline:
             raise TimeUp
 
 
@@ -623,99 +644,253 @@ def _jit_material_pst(bitboards, pst_mg, pst_eg, piece_value_mg, piece_value_eg,
     return mg, eg, phase
 
 
+def _load_nnue_model():
+    """Load a quantized, project-trained evaluator from source or a zip.
+
+    The model is deliberately a NumPy archive rather than an external ONNX
+    file: `pkgutil.get_data()` reads it both from a normal checkout and the
+    final zip submission, without extracting a mutable temporary file.  Its
+    board-plane input is [color, piece type, square] and its hidden layer is
+    evaluated from integer accumulators below.
+    """
+    try:
+        payload = pkgutil.get_data(__name__, NNUE_RESOURCE)
+    except Exception:
+        # Deliberately unnarrowed: this loader's entire contract is "never
+        # crash the engine over an optional resource". pkgutil.get_data()
+        # calls importlib.util.find_spec() internally, which raises
+        # ValueError (not OSError/TypeError) when __name__ == "__main__" -
+        # exactly the self-test invocation (`uv run python agent.py`) and
+        # plausibly close to how the platform's own loader might run this
+        # file, so that specific case is not hypothetical. A second failure
+        # mode here that crashes the whole module import over a missing
+        # weights file would be strictly worse than the eval it's meant to
+        # improve, so any exception at all falls through to the existing
+        # hand-crafted evaluate() instead of raising.
+        return None
+    if payload is None:
+        return None
+
+    try:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as model:
+            feature_weights = np.asarray(model["feature_weights"], dtype=np.int16)
+            hidden_bias = np.asarray(model["hidden_bias"], dtype=np.int32)
+            output_weights = np.asarray(model["output_weights"], dtype=np.int16)
+            output_bias = int(model["output_bias"])
+            scale = int(model["scale"])
+            blend = int(model["blend"])
+    except (KeyError, OSError, ValueError, TypeError, EOFError):
+        return None
+
+    hidden_size = hidden_bias.shape[0] if hidden_bias.ndim == 1 else 0
+    if (
+        hidden_size == 0
+        or feature_weights.shape != (2, 7, 64, hidden_size)
+        or output_weights.shape != (hidden_size,)
+        or scale <= 0
+        or not 1 <= blend <= 100
+    ):
+        return None
+    return feature_weights, hidden_bias, output_weights, output_bias, scale, blend
+
+
+NNUE_MODEL = _load_nnue_model()
+
+
+@njit(cache=False)
+def _jit_nnue_score(bitboards, feature_weights, hidden_bias, output_weights,
+                    output_bias, scale):
+    """White-relative score from a quantized board-plane network."""
+    hidden_size = hidden_bias.shape[0]
+    hidden = hidden_bias.copy()
+    one = np.uint64(1)
+    for color in range(2):
+        for piece_type in range(1, 7):
+            remaining = bitboards[color, piece_type]
+            while remaining:
+                lsb = remaining & (-remaining)
+                square = 0
+                temp = lsb
+                while temp > one:
+                    temp >>= one
+                    square += 1
+                for hidden_index in range(hidden_size):
+                    hidden[hidden_index] += feature_weights[
+                        color, piece_type, square, hidden_index]
+                remaining ^= lsb
+
+    score = output_bias
+    for hidden_index in range(hidden_size):
+        activation = hidden[hidden_index]
+        if activation > 0:
+            score += activation * output_weights[hidden_index]
+    return score // scale
+
+
+def _nnue_score(bitboards):
+    if NNUE_MODEL is None:
+        return 0
+    feature_weights, hidden_bias, output_weights, output_bias, scale, _blend = NNUE_MODEL
+    return int(_jit_nnue_score(
+        bitboards, feature_weights, hidden_bias, output_weights, output_bias, scale,
+    ))
+
+
 # Knight attacks are a fixed per-square pattern with no blockers to resolve,
-# so the table is taken directly from python-chess rather than re-derived -
-# one less place for a transcription bug to live. Sliding-piece attacks
-# (bishop/rook/queen) have no such table numba can use directly:
-# chess.BB_DIAG_ATTACKS et al. are Python dicts keyed by masked occupancy,
-# which numba cannot index efficiently, so those are computed by ray-casting
-# instead. Verified per-square against board.attacks_mask() directly (not
-# just the aggregate mobility score) across ~32000 individual square checks
-# before this was wired in.
+# so the table is taken directly from python-chess rather than re-derived. The
+# sliding tables below apply the same principle to bishops and rooks: each
+# relevant blocker subset maps to its exact attack bitboard, addressed by a
+# magic multiplier (BISHOP_MAGICS_NP/ROOK_MAGICS_NP below, found offline by
+# brute force - not derived from any external engine, just a search over
+# random sparse 64-bit values for one with no index collisions on the
+# relevant blocker set). _init_sliding_attack_tables() below builds each
+# table from python-chess's own attack dictionaries and then exhaustively
+# re-verifies every entry against them before search begins, so a wrong or
+# stale magic constant fails at import rather than silently misplaying.
 KNIGHT_ATTACKS_NP = np.array([int(bb) for bb in chess.BB_KNIGHT_ATTACKS], dtype=np.uint64)
 MOBILITY_MG_NP = np.array(MOBILITY_MG, dtype=np.int64)
 MOBILITY_EG_NP = np.array(MOBILITY_EG, dtype=np.int64)
 KING_ATTACK_WEIGHT_NP = np.array(KING_ATTACK_WEIGHT, dtype=np.int64)
 
 
+BISHOP_MAGICS_NP = np.array([
+    0x2084101400419202, 0x1004040802043000, 0x810A102000280,
+    0x508060040040000, 0x1023104000208800, 0x8201040A40800090,
+    0x4100809410408001, 0x8801008801011106, 0x2001510C08008404,
+    0x42104240C81, 0x101104400902000, 0x130080841000204,
+    0x1A8040460001028, 0x20510088102, 0x108A10104400,
+    0x1014120084140A08, 0x200006A02C0104, 0x22101008900100C0,
+    0x100120424143C0, 0x4149804802004040, 0x1842001402110160,
+    0x6022000104818C00, 0x8142000420824820, 0x2080082841100,
+    0x3024400904104400, 0x8200004090204, 0xC0280210005040,
+    0x4000C80000820040, 0x4181001015004002, 0x8008004202030090,
+    0x4108A40421000, 0x4112000410402, 0xC0108402C201400,
+    0x8043000244100, 0x8100414800404A05, 0x200220180280380,
+    0x1040102020A20080, 0x10004440020502, 0x2008202410822,
+    0x2204411A0060A080, 0xA2718080488C002, 0x1623880888080201,
+    0xD008150006100, 0x1292018000100, 0x100200840810,
+    0x82081020200101, 0x2200A00A200091B, 0x100C02862A001040,
+    0x424208210100004, 0x48829411604241, 0x5420804208241621,
+    0x3082002042020242, 0x3000446004640801, 0x40811020010B0020,
+    0x4840A80214D20040, 0x20080109006000, 0x804422014000,
+    0xD80AB18021020, 0x80A0691044445006, 0x20A808,
+    0x210010E0A201, 0x618010A0016300, 0xA3400E08210920,
+    0x92001040C2080,
+], dtype=np.uint64)
+
+ROOK_MAGICS_NP = np.array([
+    0x1080004000102080, 0x440051000402000, 0x800982E0001000,
+    0x4C80080210008004, 0x1200102A00042009, 0x880118002000C00,
+    0x400040810128302, 0x80008001304100, 0x1108800020844000,
+    0x98400050026000, 0x8022002200401080, 0x2902000910204201,
+    0x1241001802050010, 0x4000804200805400, 0x801000100020004,
+    0x8202000412028043, 0x28000400144E004, 0x8040050023008448,
+    0x460008020100080, 0x42120021420018, 0x1222818004000801,
+    0x10080104402010, 0x2440040082052850, 0x86000A492484,
+    0x4140048880006C41, 0x4802001C0035008, 0x20110100402000,
+    0x8010002100110018, 0x4104008080062800, 0x2010340080020080,
+    0x1244D0080800200, 0x40010003000884C2, 0x804000800A20,
+    0x3220086004101, 0x2A00301004010, 0x400801000800800,
+    0x1000080080805400, 0x210200050A001008, 0x4810810C004608,
+    0x200006082000401, 0x4004A0988000, 0x408201020024,
+    0x10002001808012, 0x120041218A0010, 0xC000040801010011,
+    0x2001000C00030008, 0x20020110240008, 0x4040080C5020004,
+    0x104800028400080, 0x4000400484A00380, 0xB201040820200,
+    0x200900008210100, 0x901000800100700, 0x8002011428100200,
+    0x21070810120400, 0x10090402428200, 0x62024080910062,
+    0x8024104208210082, 0x200082001011241, 0x8210041000190121,
+    0x80810050062C0801, 0x2002002801041022, 0x4410002000C01C1,
+    0x80200401208900C2,
+], dtype=np.uint64)
+
+
+def _magic_index(occupied, mask, magic, shift):
+    return (((occupied & mask) * magic) & ((1 << 64) - 1)) >> shift
+
+
+def _init_sliding_attack_tables():
+    bishop_masks = [int(mask) for mask in chess.BB_DIAG_MASKS]
+    rook_masks = [
+        int(chess.BB_FILE_MASKS[square] | chess.BB_RANK_MASKS[square])
+        for square in range(64)
+    ]
+    bishop_table = np.zeros(
+        (64, 1 << max(mask.bit_count() for mask in bishop_masks)), dtype=np.uint64,
+    )
+    rook_table = np.zeros(
+        (64, 1 << max(mask.bit_count() for mask in rook_masks)), dtype=np.uint64,
+    )
+    bishop_shifts = [64 - mask.bit_count() for mask in bishop_masks]
+    rook_shifts = [64 - mask.bit_count() for mask in rook_masks]
+
+    for square, mask in enumerate(bishop_masks):
+        for occupied, attacks in chess.BB_DIAG_ATTACKS[square].items():
+            index = _magic_index(
+                int(occupied), mask, int(BISHOP_MAGICS_NP[square]), bishop_shifts[square],
+            )
+            bishop_table[square, index] = attacks
+
+    for square, mask in enumerate(rook_masks):
+        for rank_occupied, rank_attacks in chess.BB_RANK_ATTACKS[square].items():
+            for file_occupied, file_attacks in chess.BB_FILE_ATTACKS[square].items():
+                occupied = int(rank_occupied | file_occupied)
+                attacks = int(rank_attacks | file_attacks)
+                index = _magic_index(
+                    occupied, mask, int(ROOK_MAGICS_NP[square]), rook_shifts[square],
+                )
+                rook_table[square, index] = attacks
+
+    # Every possible relevant blocker pattern is represented exactly once.
+    for square, mask in enumerate(bishop_masks):
+        for occupied, attacks in chess.BB_DIAG_ATTACKS[square].items():
+            index = _magic_index(
+                int(occupied), mask, int(BISHOP_MAGICS_NP[square]), bishop_shifts[square],
+            )
+            assert int(bishop_table[square, index]) == attacks
+    for square, mask in enumerate(rook_masks):
+        for rank_occupied, rank_attacks in chess.BB_RANK_ATTACKS[square].items():
+            for file_occupied, file_attacks in chess.BB_FILE_ATTACKS[square].items():
+                occupied = int(rank_occupied | file_occupied)
+                attacks = int(rank_attacks | file_attacks)
+                index = _magic_index(
+                    occupied, mask, int(ROOK_MAGICS_NP[square]), rook_shifts[square],
+                )
+                assert int(rook_table[square, index]) == attacks
+
+    return (
+        np.array(bishop_masks, dtype=np.uint64), bishop_table,
+        np.array(bishop_shifts, dtype=np.uint8), np.array(rook_masks, dtype=np.uint64),
+        rook_table, np.array(rook_shifts, dtype=np.uint8),
+    )
+
+
+(BISHOP_MASKS_NP, BISHOP_ATTACKS_NP, BISHOP_SHIFTS_NP,
+ ROOK_MASKS_NP, ROOK_ATTACKS_NP, ROOK_SHIFTS_NP) = _init_sliding_attack_tables()
+
+
+@njit(cache=False)
+def _slider_attacks_jit(square, occupied, masks, magics, shifts, attacks):
+    # Public helpers can be called with a signed Python int; normalize before
+    # multiplication so magic indexing always wraps as uint64.
+    blockers = np.uint64(occupied) & masks[square]
+    index = (blockers * magics[square]) >> shifts[square]
+    return attacks[square, int(index)]
+
+
 @njit(cache=False)
 def _diag_attacks_jit(square, occupied):
-    attacks = np.uint64(0)
-    one = np.uint64(1)
-    file = square % 8
-    rank = square // 8
-
-    f, r = file + 1, rank + 1
-    while f < 8 and r < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f += 1
-        r += 1
-    f, r = file - 1, rank + 1
-    while f >= 0 and r < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f -= 1
-        r += 1
-    f, r = file + 1, rank - 1
-    while f < 8 and r >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f += 1
-        r -= 1
-    f, r = file - 1, rank - 1
-    while f >= 0 and r >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f -= 1
-        r -= 1
-    return attacks
+    return _slider_attacks_jit(
+        square, occupied, BISHOP_MASKS_NP, BISHOP_MAGICS_NP, BISHOP_SHIFTS_NP,
+        BISHOP_ATTACKS_NP,
+    )
 
 
 @njit(cache=False)
 def _orth_attacks_jit(square, occupied):
-    attacks = np.uint64(0)
-    one = np.uint64(1)
-    file = square % 8
-    rank = square // 8
-
-    f, r = file, rank + 1
-    while r < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        r += 1
-    f, r = file, rank - 1
-    while r >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        r -= 1
-    f, r = file + 1, rank
-    while f < 8:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f += 1
-    f, r = file - 1, rank
-    while f >= 0:
-        bit = one << (r * 8 + f)
-        attacks |= bit
-        if occupied & bit:
-            break
-        f -= 1
-    return attacks
+    return _slider_attacks_jit(
+        square, occupied, ROOK_MASKS_NP, ROOK_MAGICS_NP, ROOK_SHIFTS_NP,
+        ROOK_ATTACKS_NP,
+    )
 
 
 @njit(cache=False)
@@ -886,7 +1061,10 @@ def evaluate(board, alpha=-INFINITY, beta=INFINITY, mg_eg_phase=None):
     if not white_to_move:
         lazy = -lazy
 
-    if lazy - LAZY_MARGIN >= beta or lazy + LAZY_MARGIN <= alpha:
+    # A loaded neural model can move the full score either way, so the
+    # handcrafted pass-1 bound is only sound when no model is active.
+    if (NNUE_MODEL is None
+            and (lazy - LAZY_MARGIN >= beta or lazy + LAZY_MARGIN <= alpha)):
         return lazy
 
     # ---- pass 2: the positional terms -------------------------------------
@@ -975,6 +1153,11 @@ def evaluate(board, alpha=-INFINITY, beta=INFINITY, mg_eg_phase=None):
     score = (mg * phase + eg * (MAX_PHASE - phase)) // MAX_PHASE
     score += TEMPO if white_to_move else -TEMPO
 
+    if NNUE_MODEL is not None:
+        blend = NNUE_MODEL[-1]
+        neural_score = _nnue_score(bitboards)
+        score = (score * (100 - blend) + neural_score * blend) // 100
+
     return score if white_to_move else -score
 
 
@@ -993,9 +1176,10 @@ def game_phase(board):
 # =============================================================================
 
 
-def order_moves(board, moves, tt_move, ply, prev_move):
+def order_moves(board, moves, tt_move, ply, prev_move, prev_prev_move=None):
     """TT move, then captures by MVV-LVA, then promotions, then killers, then
-    the counter move, then history. Alpha-beta only pays when this is right."""
+    the counter move, history and continuation history. Alpha-beta only pays
+    when this is right."""
     them = board.occupied_co[not board.turn]
     killer0, killer1 = KILLERS[ply] if ply < MAX_PLY else (0, 0)
     counter = 0
@@ -1039,6 +1223,13 @@ def order_moves(board, moves, tt_move, ply, prev_move):
             else:
                 piece_type = board.piece_type_at(move.from_square)
                 score = HISTORY[piece_type][move.from_square][to_square]
+                current = _move_history_index(move)
+                if prev_move is not None:
+                    score += int(CONTINUATION_HISTORY[
+                        0, _move_history_index(prev_move), current])
+                if prev_prev_move is not None:
+                    score += int(CONTINUATION_HISTORY[
+                        1, _move_history_index(prev_prev_move), current])
 
         append((score, move))
 
@@ -1570,7 +1761,7 @@ SINGULAR_MARGIN = 60         # cp the TT move must clear every alternative by
 
 
 def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None,
-            mg_eg_phase=None, excluded_move=None):
+            mg_eg_phase=None, excluded_move=None, prev_prev_move=None):
     SEARCH.nodes += 1
     SEARCH.check_time()
 
@@ -1670,7 +1861,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
     # --- internal iterative deepening -------------------------------------
     if tt_move is None and depth >= 4 and is_pv:
         negamax(board, depth - 2, alpha, beta, ply, prev_move, allow_null, key,
-                mg_eg_phase)
+                mg_eg_phase, prev_prev_move=prev_prev_move)
         tt_depth = int(TT_DEPTH[index])
         tt_hit = tt_depth >= 0 and int(TT_KEY[index]) == key
         if tt_hit:
@@ -1727,7 +1918,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             se_score = negamax(board, verify_depth, singular_beta - 1,
                                 singular_beta, ply, prev_move,
                                 allow_null=allow_null, key=key,
-                                mg_eg_phase=mg_eg_phase, excluded_move=tt_move)
+                                mg_eg_phase=mg_eg_phase, excluded_move=tt_move,
+                                prev_prev_move=prev_prev_move)
             if se_score < singular_beta:
                 se_extension = 1
 
@@ -1744,7 +1936,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
             child_key = _zobrist_post(board, key, zpre)
             score = -negamax(board, depth - 1 + se_extension, -beta, -alpha,
                              ply + 1, move, key=child_key,
-                             mg_eg_phase=child_mg_eg_phase)
+                             mg_eg_phase=child_mg_eg_phase,
+                             prev_prev_move=prev_move)
             piece_type = board.piece_type_at(move.to_square)
             board.pop()
             searched = 1
@@ -1775,6 +1968,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                             else:
                                 HISTORY[piece_type][move.from_square][
                                     move.to_square] += depth * depth
+                        _continuation_update(prev_move, prev_prev_move, move, depth)
             if not cutoff and HISTORY_AGING_ENABLED and is_quiet and piece_type:
                 # Tried, didn't cut off: a malus candidate if a later move in
                 # the main loop below does.
@@ -1787,7 +1981,7 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 # variant; in standard chess it is a draw and must score 0.
                 return -MATE_SCORE + ply if in_check else 0
 
-            moves = order_moves(board, moves, tt_move, ply, prev_move)
+            moves = order_moves(board, moves, tt_move, ply, prev_move, prev_prev_move)
             # Forced-reply extension: one legal move costs nothing extra to
             # search one ply deeper, since there is nothing else at this node
             # to spend that node budget on. Deliberately the strict len==1
@@ -1825,7 +2019,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                 if searched == 0:
                     score = -negamax(board, depth - 1 + one_reply_ext, -beta,
                                      -alpha, ply + 1, move, key=child_key,
-                                     mg_eg_phase=child_mg_eg_phase)
+                                     mg_eg_phase=child_mg_eg_phase,
+                                     prev_prev_move=prev_move)
                 else:
                     reduction = 0
                     if is_quiet and depth >= 3 and not gives_check and move_index >= 3:
@@ -1839,7 +2034,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
 
                     score = -negamax(board, depth - 1 - reduction, -alpha - 1,
                                      -alpha, ply + 1, move, key=child_key,
-                                     mg_eg_phase=child_mg_eg_phase)
+                                     mg_eg_phase=child_mg_eg_phase,
+                                     prev_prev_move=prev_move)
 
                     # The reduced search beat alpha, so redo it at full depth.
                     if reduction > 0:
@@ -1848,13 +2044,15 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                             SEARCH.lmr_full_researches += 1
                             score = -negamax(board, depth - 1, -alpha - 1, -alpha,
                                              ply + 1, move, key=child_key,
-                                             mg_eg_phase=child_mg_eg_phase)
+                                             mg_eg_phase=child_mg_eg_phase,
+                                             prev_prev_move=prev_move)
 
                     # PVS re-search on a full window inside the bounds.
                     if alpha < score < beta:
                         score = -negamax(board, depth - 1, -beta, -alpha,
                                          ply + 1, move, key=child_key,
-                                         mg_eg_phase=child_mg_eg_phase)
+                                         mg_eg_phase=child_mg_eg_phase,
+                                         prev_prev_move=prev_move)
 
                 piece_type = board.piece_type_at(move.to_square)
                 board.pop()
@@ -1893,6 +2091,8 @@ def negamax(board, depth, alpha, beta, ply, prev_move, allow_null=True, key=None
                                     else:
                                         HISTORY[piece_type][move.from_square][
                                             move.to_square] += depth * depth
+                                _continuation_update(
+                                    prev_move, prev_prev_move, move, depth)
                             break
                 if HISTORY_AGING_ENABLED and is_quiet and piece_type:
                     # Tried, didn't cut off this node: a malus candidate if a
@@ -2070,32 +2270,59 @@ def search_root(board, soft_s, hard_s, trace=None):
             delta = ASPIRATION_DELTA
             alpha, beta = prev_score - delta, prev_score + delta
 
+        # An aspiration fail returns a bound, not a usable iteration. Keep the
+        # previous completed result until a re-search closes the window.
+        completed_iteration = False
+        finished = True
+        iter_move = None
         while True:
+            try:
+                # Recursive search checks the clock every 1024 nodes. The
+                # re-search loop has no node work of its own, so check it on
+                # every pass to avoid starting a fresh window after expiry.
+                SEARCH.check_time(force=True)
+            except TimeUp:
+                finished = False
+                break
+
             iter_move, iter_score, finished, failed_high = _root_window(
                 board, root_moves, best_move, depth, alpha, beta, base_stack,
                 trace=trace)
-            if not finished or delta == 0:
+            if not finished:
                 break
-            if failed_high:
+            if delta and failed_high:
                 delta *= 2
                 beta = min(INFINITY, iter_score + delta)
                 continue
-            if iter_score <= alpha:
-                # Fail low: the position is worse than assumed. What comes back
-                # is an upper bound, so widen downwards and search again.
+            if delta and iter_score <= alpha:
+                # Fail low: iter_score is an upper bound, so it cannot replace
+                # the prior iteration until the widened search completes.
                 delta *= 2
                 alpha = max(-INFINITY, iter_score - delta)
                 continue
+            completed_iteration = True
             break
 
-        # A partial iteration is still usable: the previous best was searched
-        # first, so anything that beat it beat it on a real search.
-        if iter_move is not None:
+        if delta == 0 and not completed_iteration and iter_move is not None:
+            # A plain full-window search never returns a mere bound (that
+            # ambiguity only exists once alpha/beta have been narrowed by
+            # aspiration), so a TimeUp partway through _root_window still
+            # leaves a genuine, exact comparison among whatever candidates
+            # were fully searched before the clock ran out - restores the
+            # pre-aspiration "a partial iteration is still usable" behavior
+            # for exactly the case that carries no bound-vs-exact risk. An
+            # actual aspiration attempt (delta != 0) still requires
+            # completed_iteration below, since that path can genuinely
+            # return only a bound - the bug this rewrite exists to fix.
             best_move = iter_move
             best_score = iter_score
 
-        if not finished:
+        if not completed_iteration or not finished:
             break
+
+        assert iter_move is not None
+        best_move = iter_move
+        best_score = iter_score
 
         completed_depth = depth
         pv = _extract_pv(board, best_move, 8)
