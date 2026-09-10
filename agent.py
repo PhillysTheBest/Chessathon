@@ -84,7 +84,9 @@ LOW_CLOCK_MS = 20000.0
 ASPIRATION_DELTA = 25
 ASPIRATION_MIN_DEPTH = 999
 
-TT_SIZE = 1 << 20
+# 32M entries * 15 bytes = about 480 MiB, leaving ample room within the 2 GiB
+# competition limit while preventing a single deep search from thrashing the TT.
+TT_SIZE = 1 << 25
 TT_MASK = TT_SIZE - 1
 TT_EXACT, TT_LOWER, TT_UPPER = 0, 1, 2
 
